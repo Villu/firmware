@@ -7,6 +7,7 @@
 #include "comms/PacketClient.h"
 #include "comms/PacketServer.h"
 #include "graphics/DeviceScreen.h"
+#include "graphics/TrackballPointer.h"
 #include "graphics/driver/DisplayDriverConfig.h"
 #include "util/ISpiLock.h"
 
@@ -429,6 +430,9 @@ void tftSetup(void)
         }
         tftSleepObserver->observe(&notifyLightSleep);
         endSleepObserver->observe(&notifyLightSleepEnd);
+#if HAS_TRACKBALL_POINTER
+        trackballPointerInit(); // before the UI task runs: LVGL is not to be called from two threads
+#endif
         xTaskCreatePinnedToCore(tft_task_handler, "tft", TFT_TASK_STACK_SIZE, NULL, 1, NULL, 0);
 #elif defined(ARCH_PORTDUINO)
         std::thread *tft_task = new std::thread([] { tft_task_handler(); });
