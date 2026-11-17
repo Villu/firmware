@@ -416,10 +416,19 @@ bool initWifi()
             // before the handler is registered, causing onNetworkConnected() to never run.
             WiFi.onEvent(WiFiEvent);
             WiFi.setAutoReconnect(true);
-            WiFi.setSleep(false);
+#if MESHCORE_COEXIST
+            // Bluetooth runs beside WiFi in this build and the two take turns on the one radio, which needs WiFi's
+            // modem sleep: the WiFi driver stops the firmware if it is off while Bluetooth is on.
+            if (config.bluetooth.enabled) {
+                WiFi.setSleep(true);
+            } else
+#endif
+            {
+                WiFi.setSleep(false);
 
-            // This is needed to improve performance.
-            esp_wifi_set_ps(WIFI_PS_NONE); // Disable radio power saving
+                // This is needed to improve performance.
+                esp_wifi_set_ps(WIFI_PS_NONE); // Disable radio power saving
+            }
 
             WiFi.onEvent(
                 [](WiFiEvent_t event, WiFiEventInfo_t info) {

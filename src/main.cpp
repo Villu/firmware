@@ -470,7 +470,11 @@ void setup()
     LOG_INFO("\n\n//\\ E S H T /\\ S T / C\n");
 
 #if defined(ARCH_ESP32) && defined(BOARD_HAS_PSRAM)
-#ifndef SENSECAP_INDICATOR
+#if MESHCORE_COEXIST
+    // Bluetooth and WiFi run together in this build and leave little internal RAM: keep it for what has to be there and
+    // send malloc calls from 256 bytes up to PSRAM
+    heap_caps_malloc_extmem_enable(256);
+#elif !defined(SENSECAP_INDICATOR)
     // use PSRAM for malloc calls > 2048 bytes
     heap_caps_malloc_extmem_enable(2048);
 #endif

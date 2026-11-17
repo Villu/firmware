@@ -74,7 +74,11 @@ static bool bluetoothMemoryReleaseWarned;
 #if !defined(CONFIG_IDF_TARGET_ESP32S2) && !MESHTASTIC_EXCLUDE_BLUETOOTH
 static bool isNetworkConfiguredToDisableBluetooth()
 {
-#if HAS_WIFI
+#if MESHCORE_COEXIST
+    // This build runs Bluetooth beside WiFi: the ESP32 gives the one radio to each in turn (WiFi keeps modem sleep on,
+    // see initWifi)
+    return false;
+#elif HAS_WIFI
     return isWifiAvailable();
 #elif defined(USE_WS5500) || defined(USE_CH390D)
     return config.network.wifi_enabled;
@@ -132,7 +136,7 @@ void setBluetoothEnable(bool enable)
 
 #if defined(USE_WS5500) || defined(USE_CH390D)
     if ((config.bluetooth.enabled == true) && (config.network.wifi_enabled == false))
-#elif HAS_WIFI
+#elif HAS_WIFI && !MESHCORE_COEXIST
     if (!isWifiAvailable() && config.bluetooth.enabled == true)
 #else
     if (config.bluetooth.enabled == true)
