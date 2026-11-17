@@ -1,3 +1,6 @@
+> [!NOTE]
+> This is a personal fork of the Meshtastic firmware. Its branch `meshcore-coexist` adds MeshCore beside Meshtastic on the LilyGo T-Deck Plus; [NOTICE.md](NOTICE.md) says what it is and where its code comes from. It is experimental, it is not an official Meshtastic build, and it is not affiliated with or endorsed by the Meshtastic project. Meshtastic® is a registered trademark of Meshtastic LLC.
+
 <div align="center" markdown="1">
 
 <img src=".github/meshtastic_logo.png" alt="Meshtastic Logo" width="80"/>
