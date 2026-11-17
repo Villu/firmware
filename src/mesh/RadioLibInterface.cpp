@@ -117,6 +117,11 @@ void INTERRUPT_ATTR RadioLibInterface::isrTxLevel0()
  */
 RadioLibInterface *RadioLibInterface::instance;
 
+#if MESHCORE_COEXIST
+#include "SideChannel.h"
+SideChannelRadio *SideChannelRadio::instance = nullptr;
+#endif
+
 /** At most one busyRx deferral line per this interval; the line carries the count it stands for. */
 #define BUSY_RX_LOG_INTERVAL_MS 30000
 
@@ -127,6 +132,9 @@ bool RadioLibInterface::canSendImmediately()
     // To do otherwise would be doubly bad because not only would we drop the packet that was on the way in,
     // we almost certainly guarantee no one outside will like the packet we are sending.
     bool busyTx = sendingPacket != NULL;
+    // Off on the side network for a look or a frame: not now, and the caller's backoff asks again
+    if (!busyTx && sideChannelAway)
+        return false;
     // isActivelyReceiving() reads the chip over SPI. Unlocked, it can split the readout task's command and wedge BUSY for
     // RadioLib's whole BUSY timeout. The lock is recursive, so a caller already holding it re-enters.
     bool busyRx = false;
@@ -356,7 +364,7 @@ bool RadioLibInterface::findInTxQueue(NodeNum from, PacketId id)
 void RadioLibInterface::updateNoiseFloor()
 {
     // Only sample from idle receive mode. TX/RX-critical paths must return to radio work quickly.
-    if (!isReceiving || sendingPacket != NULL) {
+    if (!isReceiving || sendingPacket != NULL || sideChannelAway) {
         return;
     }
     // Ahead of the lock and the chip reads below, which then cost nothing on the iterations this skips
@@ -1006,6 +1014,8 @@ void RadioLibInterface::pollMissedIrqs()
     // RadioLibInterface::enableInterrupt uses EDGE-TRIGGERED interrupts. Poll as a backup to catch missed edges.
     // The main loop's flag reads are a sequence too: an LR11x0/LR20x0 status read zeroes RadioLib's per-Module SPI widths
     // for its transfer, so a readout landing inside one would take the chip's status bytes for the frame length.
+    if (sideChannelAway) // the side task re-arms RX itself; the next poll looks again
+        return;
     RadioSequence seq(this);
     if (isReceiving) {
         checkRxDoneIrqFlag();
@@ -1151,6 +1161,8 @@ void RadioLibInterface::periodicRadioMaintenance()
     // Every startReceive() call site is event-driven (RX/TX ISR, the CAD-busy branch, reconfigure), and a
     // radio left with RX off can no longer raise an RX interrupt - on a node with nothing to transmit
     // nothing would ever re-arm it. This periodic tick is that retry; maybeRecoverChipStateLoss() throttles.
+    if (sideChannelAway)
+        return;
     if (rxOffline) {
         LOG_WARN("Radio RX offline, retrying");
         RadioSequence seq(this); // a re-init and the arm that follows it are one sequence

@@ -4,6 +4,12 @@
 #include "RadioLibInterface.h"
 #include "configuration.h"
 
+// A second LoRa network (MeshCore) received between Meshtastic frames: see SideChannel.h
+#if MESHCORE_COEXIST && defined(MESHTASTIC_RX_READOUT_TASK)
+#define SX126X_SIDE_CHANNEL
+#include "SideChannel.h"
+#endif
+
 // After TX_DONE the SX126x waits in standby for the radio thread to restart RX, which a main-loop hold can stretch by
 // hundreds of ms. With the readout task, the TX_DONE interrupt has the task restart it instead, on every platform the
 // task runs on.
@@ -12,7 +18,12 @@
  * \brief Adapter for SX126x radio family. Implements common logic for child classes.
  * \tparam T RadioLib module type for SX126x: SX1262, SX1268.
  */
-template <class T> class SX126xInterface : public RadioLibInterface
+template <class T>
+class SX126xInterface : public RadioLibInterface
+#ifdef SX126X_SIDE_CHANNEL
+    ,
+                        public SideChannelRadio
+#endif
 {
   public:
     SX126xInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
@@ -182,5 +193,53 @@ template <class T> class SX126xInterface : public RadioLibInterface
 
     /** Recover a chip that lost its runtime state: hardware-reset via begin() and reprogram */
     bool recoverChipStateLoss() override { return reinitChip() && programModemParams() == RADIOLIB_ERR_NONE; }
+
+#ifdef SX126X_SIDE_CHANNEL
+  public:
+    bool sideChannelStart(const SideChannelConfig &cfg) override;
+    void sideChannelStop() override { sideEnabled = false; }
+    bool sideChannelRunning() const override { return sideEnabled && sideTask; }
+    bool sideChannelSend(const uint8_t *data, size_t len) override;
+    bool sideChannelTakeSendResult(bool &ok) override;
+    bool sideChannelRecv(SideChannelFrame &out) override;
+    void sideChannelCancelSend() override
+    {
+        if (sideTxState == SIDE_TX_PENDING)
+            sideTxState = SIDE_TX_IDLE;
+    }
+    bool sideChannelReceiving() const override { return sideRxActive || sideHomeBusy; }
+    void sideChannelGetStats(SideChannelStats &out) const override { out = sideStats; }
+    uint32_t sideChannelAirtimeMs(size_t len) const override;
+    int8_t sideChannelTxPower() const override { return power; }
+
+  private:
+    enum SideLook : uint8_t { SIDE_LOOK_DONE, SIDE_LOOK_HOME_BUSY, SIDE_LOOK_RADIO_OFF };
+    enum SideTxState : uint8_t { SIDE_TX_IDLE, SIDE_TX_PENDING, SIDE_TX_SENT, SIDE_TX_FAILED };
+
+    SideChannelConfig sideCfg = {};
+    volatile bool sideEnabled = false;
+    volatile bool sideRxActive = false;
+    volatile bool sideHomeBusy = false; // the last look was put off
+    TaskHandle_t sideTask = nullptr;
+    QueueHandle_t sideRxQueue = nullptr;
+    uint8_t sideTxBuf[255];
+    volatile uint16_t sideTxLen = 0;
+    volatile uint8_t sideTxState = SIDE_TX_IDLE;
+    /** A bare preamble was seen at home: no look until its header would have shown */
+    uint32_t sideHomeHoldUntil = 0;
+    SideChannelStats sideStats = {};
+
+    static void sideTaskMain(void *arg);
+    void sideTaskLoop();
+    /** Whether the home receive is idle, so that leaving it for a look costs nothing */
+    SideLook sideHomeState();
+    SideLook sideLook();
+    void sideCatchFrame(const SideChannelConfig &c);
+    void sideTransmit(const SideChannelConfig &c);
+    void sideGoHome();
+    int16_t sideStandby();
+    int16_t sideTune(float freqMHz, float bwKHz, uint8_t sfv, uint8_t crv, uint8_t sw);
+    int16_t sidePacketParams(uint16_t preamble, uint8_t len);
+#endif
 };
 #endif

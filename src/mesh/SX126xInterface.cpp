@@ -29,6 +29,9 @@ SX126xInterface<T>::SX126xInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs
     : RadioLibInterface(hal, cs, irq, rst, busy, &lora), lora(&module)
 {
     LOG_DEBUG_RADIO("SX126xInterface(cs=%d, irq=%d, rst=%d, busy=%d)", cs, irq, rst, busy);
+#ifdef SX126X_SIDE_CHANNEL
+    SideChannelRadio::instance = this;
+#endif
 }
 
 /// Initialise the Driver transport hardware and software.
@@ -1102,4 +1105,7 @@ template <typename T> void SX126xInterface<T>::setTransmitEnable(bool txon)
 #endif
 }
 
+#ifdef SX126X_SIDE_CHANNEL
+#include "SX126xSideChannel.inl"
+#endif
 #endif

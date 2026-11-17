@@ -7,6 +7,9 @@
 #include "../concurrency/Periodic.h"
 #include "BluetoothCommon.h" // needed for updateBatteryLevel, FIXME, eventually when we pull mesh out into a lib we shouldn't be whacking bluetooth from here
 #include "MeshService.h"
+#if MESHCORE_COEXIST
+#include "modules/MeshCoreModule.h"
+#endif
 #include "MessageStore.h"
 #include "NodeDB.h"
 #include "Power.h"
@@ -234,6 +237,23 @@ void MeshService::reconcilePendingRxTimes()
             fromNum++; // notify observers so the phone can resync
         }
     }
+
+#if SCREEN_HAS_OWN_QUEUE
+    for (int remaining = toScreenQueue.numUsed(); remaining > 0; remaining--) {
+        meshtastic_MeshPacket *p = toScreenQueue.dequeuePtr(0);
+        if (!p)
+            break;
+        if (!p->has_rx_time) {
+            const uint32_t elapsedSecs = nowUptimeSecs - p->rx_time;
+            if (elapsedSecs < nowEpoch) {
+                p->rx_time = nowEpoch - elapsedSecs;
+                p->has_rx_time = true;
+            }
+        }
+        if (!toScreenQueue.enqueue(p, 0))
+            releaseToPool(p);
+    }
+#endif
 }
 
 #if MESHTASTIC_ENABLE_FRAME_INJECTION
@@ -319,6 +339,12 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
 
     // Record the time the packet arrived from the phone.
     stampRxTime(&p);
+
+#if MESHCORE_COEXIST
+    // Text for MeshCore's channel or for a MeshCore node goes out over MeshCore, never as Meshtastic
+    if (meshCoreModule && meshCoreModule->handleFromPhone(p))
+        return;
+#endif
 
     IF_SCREEN(if (p.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP && p.decoded.payload.size > 0 &&
                   p.to != NODENUM_BROADCAST && p.to != 0) // DM only
@@ -509,6 +535,12 @@ void MeshService::sendToPhone(meshtastic_MeshPacket *p)
 #endif
 #endif
 
+#if SCREEN_HAS_OWN_QUEUE
+    // Before the phone queue's own limits: with no phone connected that queue stays full, the screen's must not care.
+    if (auto *forScreen = packetPool.allocCopy(*p))
+        sendToScreen(forScreen);
+#endif
+
     if (toPhoneQueue.numFree() == 0) {
         // ROUTING_APP is the phone's only delivery confirmation, so it displaces the oldest like
         // text does. Gate the variant: decoded.portnum aliases encrypted.size in the union.
@@ -535,6 +567,37 @@ void MeshService::sendToPhone(meshtastic_MeshPacket *p)
     }
     fromNum++;
 }
+
+#if SCREEN_HAS_OWN_QUEUE
+void MeshService::sendToScreen(meshtastic_MeshPacket *p)
+{
+    if (toScreenQueue.numFree() == 0) {
+        if (meshtastic_MeshPacket *oldest = toScreenQueue.dequeuePtr(0))
+            releaseToPool(oldest);
+    }
+    if (!toScreenQueue.enqueue(p, 0))
+        releaseToPool(p);
+}
+
+void MeshService::showOnScreen(const char *text)
+{
+    meshtastic_MeshPacket *p = packetPool.allocZeroed();
+    if (!p)
+        return;
+    p->from = p->to = nodeDB->getNodeNum();
+    p->id = (uint32_t)random(1, 0x7FFFFFFF);
+    p->rx_time = getValidTime(RTCQualityFromNet);
+    p->has_rx_time = p->rx_time != 0;
+    if (!p->has_rx_time)
+        p->rx_time = Time::getUptimeSecs(); // the placeholder reconcilePendingRxTimes() expects
+    p->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    size_t len = strnlen(text, sizeof(p->decoded.payload.bytes) - 1);
+    memcpy(p->decoded.payload.bytes, text, len);
+    p->decoded.payload.size = len;
+    sendToScreen(p);
+}
+#endif
 
 void MeshService::sendMqttMessageToClientProxy(meshtastic_MqttClientProxyMessage *m)
 {

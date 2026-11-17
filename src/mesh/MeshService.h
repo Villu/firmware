@@ -25,6 +25,12 @@
 #endif
 #endif
 
+#if MESHCORE_COEXIST && defined(USE_PACKET_API)
+// The device's own screen (PacketAPI) gets its own copy of every packet queued for the phone, so the screen and a
+// phone client (Bluetooth, serial, TCP) work side by side instead of taking packets from each other.
+#define SCREEN_HAS_OWN_QUEUE 1
+#endif
+
 extern Allocator<meshtastic_QueueStatus> &queueStatusPool;
 extern Allocator<meshtastic_MqttClientProxyMessage> &mqttClientProxyMessagePool;
 extern Allocator<meshtastic_ClientNotification> &clientNotificationPool;
@@ -47,6 +53,11 @@ class MeshService
     PointerQueue<meshtastic_MeshPacket> toPhoneQueue;
 #else
     StaticPointerQueue<meshtastic_MeshPacket, MAX_RX_TOPHONE> toPhoneQueue;
+#endif
+
+#if SCREEN_HAS_OWN_QUEUE
+    /// the same packets again, waiting for the device's own screen
+    StaticPointerQueue<meshtastic_MeshPacket, MAX_RX_TOPHONE> toScreenQueue;
 #endif
 
     // keep list of QueueStatus packets to be send to the phone
@@ -127,6 +138,17 @@ class MeshService
     /// Return the next packet destined to the phone.  FIXME, somehow use fromNum to allow the phone to retry the
     /// last few packets if needs to.
     meshtastic_MeshPacket *getForPhone() { return toPhoneQueue.dequeuePtr(0); }
+
+#if SCREEN_HAS_OWN_QUEUE
+    /// Return the next packet for the device's own screen
+    meshtastic_MeshPacket *getForScreen() { return toScreenQueue.dequeuePtr(0); }
+
+    /// Queue a packet for the screen only (takes ownership; drops the oldest when full)
+    void sendToScreen(meshtastic_MeshPacket *p);
+
+    /// Show a line of text on the screen only, as a message from this node to itself
+    void showOnScreen(const char *text);
+#endif
 
     /// Allows the bluetooth handler to free packets after they have been sent
     void releaseToPool(meshtastic_MeshPacket *p) { packetPool.release(p); }

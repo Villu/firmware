@@ -240,6 +240,12 @@ class PhoneAPI
      */
     virtual void onNowHasData(uint32_t fromRadioNum) {}
 
+    /// The next mesh packet for this client. The device's own screen reads its own copy of the queue.
+    virtual meshtastic_MeshPacket *nextMeshPacket();
+
+    /// False for a client that leaves the phone's queue status, MQTT proxy messages and notifications alone.
+    virtual bool takesPhoneExtras() { return true; }
+
     /// Subclasses can use these lifecycle hooks for transport-specific behavior around config/steady-state
     /// (i.e. BLE connection params)
     virtual void onConfigStart() {}

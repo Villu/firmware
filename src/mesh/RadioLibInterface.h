@@ -291,6 +291,10 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     /// Set by a driver's startReceive() when it gives up and leaves RX off; cleared once RX is armed again.
     bool rxOffline = false;
 
+    /// A driver task has the chip on another network's settings (see SideChannel.h) and holds the radio-sequence lock
+    /// until it is back. The main loop's periodic chip reads skip a round instead of waiting for it.
+    volatile bool sideChannelAway = false;
+
     /**
      * Debugging counts
      */

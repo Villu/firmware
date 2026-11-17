@@ -1703,12 +1703,14 @@ bool PhoneAPI::available()
         prefetchNodeInfos();
         return true;
     case STATE_SEND_PACKETS: {
-        if (!queueStatusPacketForPhone)
-            queueStatusPacketForPhone = service->getQueueStatusForPhone();
-        if (!mqttClientProxyMessageForPhone)
-            mqttClientProxyMessageForPhone = service->getMqttClientProxyMessageForPhone();
-        if (!clientNotification)
-            clientNotification = service->getClientNotificationForPhone();
+        if (takesPhoneExtras()) {
+            if (!queueStatusPacketForPhone)
+                queueStatusPacketForPhone = service->getQueueStatusForPhone();
+            if (!mqttClientProxyMessageForPhone)
+                mqttClientProxyMessageForPhone = service->getMqttClientProxyMessageForPhone();
+            if (!clientNotification)
+                clientNotification = service->getClientNotificationForPhone();
+        }
         bool hasPacket = !!queueStatusPacketForPhone || !!mqttClientProxyMessageForPhone || !!clientNotification;
 #ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
         if (hasPendingLockdownStatus())
@@ -1735,7 +1737,7 @@ bool PhoneAPI::available()
 #endif
 
         if (!packetForPhone)
-            packetForPhone = service->getForPhone();
+            packetForPhone = nextMeshPacket();
         hasPacket = !!packetForPhone;
         if (hasPacket)
             return true;
@@ -1748,6 +1750,11 @@ bool PhoneAPI::available()
     }
 
     return false;
+}
+
+meshtastic_MeshPacket *PhoneAPI::nextMeshPacket()
+{
+    return service->getForPhone();
 }
 
 void PhoneAPI::sendNotification(meshtastic_LogRecord_Level level, uint32_t replyId, const char *message)

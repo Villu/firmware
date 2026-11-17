@@ -1,0 +1,29 @@
+{
+  "name": "MeshCore",
+  "version": "1.18.0",
+  "description": "MeshCore companion firmware (github.com/meshcore-dev/MeshCore, tag companion-v1.18.0, commit 81dbae5) hosted inside another firmware: the mesh core, the chat mesh and the companion app protocol, with the radio, clock, storage and app links supplied by the host through src/MeshCoreHost.h. Upstream files are unchanged except where marked MESHCORE_HOSTED.",
+  "license": "MIT",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": [
+    { "owner": "electroniccats", "name": "CayenneLPP", "version": "1.6.1" },
+    { "owner": "densaugeo", "name": "base64", "version": "~1.4.0" }
+  ],
+  "build": {
+    "flags": [
+      "-w",
+      "-DMESHCORE_HOSTED=1",
+      "-DESP32_PLATFORM",
+      "-DMAX_CONTACTS=350",
+      "-DMAX_GROUP_CHANNELS=40",
+      "-DOFFLINE_QUEUE_SIZE=256",
+      "-DLORA_FREQ=869.618",
+      "-DLORA_BW=62.5",
+      "-DLORA_SF=8",
+      "-DLORA_CR=8",
+      "-DLORA_TX_POWER=22",
+      "-DENABLE_PRIVATE_KEY_IMPORT=1",
+      "-DENABLE_PRIVATE_KEY_EXPORT=1"
+    ]
+  }
+}

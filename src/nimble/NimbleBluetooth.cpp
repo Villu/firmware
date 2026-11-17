@@ -7,6 +7,7 @@
 
 #include "concurrency/OSThread.h"
 #include "main.h"
+#include "mesh/MeshService.h"
 #include "mesh/PhoneAPI.h"
 #include "mesh/Throttle.h"
 #include "mesh/mesh-pb-constants.h"
@@ -474,6 +475,97 @@ static BluetoothPhoneAPI *bluetoothPhoneAPI;
 // Last ToRadio value received from the phone
 static uint8_t lastToRadio[MAX_TO_FROM_RADIO_SIZE];
 
+#if MESHCORE_COEXIST
+#include <MeshCoreHost.h>
+
+// The Nordic UART service, over which the MeshCore phone app speaks its companion protocol: whole frames written to
+// RX, whole frames notified on TX. It sits beside the Meshtastic service on the same server and under the same pairing.
+#define MESHCORE_NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define MESHCORE_NUS_RX_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define MESHCORE_NUS_TX_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+class MeshCoreBleLink : public meshcore_host::AppLink, public BLECharacteristicCallbacks
+{
+    struct Frame {
+        uint8_t len;
+        uint8_t data[MAX_FRAME];
+    };
+    static const uint8_t QUEUE = 8;
+    // From the app: the NimBLE task fills it, the main loop empties it
+    Frame rx[QUEUE];
+    volatile uint8_t rxHead = 0, rxTail = 0;
+    // To the app: main loop only
+    Frame tx[QUEUE];
+    uint8_t txHead = 0, txTail = 0;
+    uint32_t lastNotifyMs = 0;
+    // The MeshCore app has written on this connection. A connection alone may be the Meshtastic app's.
+    volatile bool appSeen = false;
+
+  public:
+    BLECharacteristic *txCharacteristic = nullptr;
+
+    void onWrite(BLECharacteristic *c) override
+    {
+        // Runs in the NimBLE task
+        const size_t len = c->getLength();
+        const uint8_t next = (uint8_t)((rxHead + 1) % QUEUE);
+        if (len == 0 || len > MAX_FRAME || next == rxTail)
+            return;
+        rx[rxHead].len = (uint8_t)len;
+        memcpy(rx[rxHead].data, c->getData(), len);
+        rxHead = next;
+        appSeen = true;
+    }
+
+    void onDisconnect()
+    {
+        appSeen = false;
+        rxTail = rxHead;
+    }
+
+    bool isConnected() override { return appSeen && nimbleBluetooth && nimbleBluetooth->isConnected(); }
+    bool canWrite() override { return (uint8_t)((txHead + 1) % QUEUE) != txTail; }
+
+    size_t writeFrame(const uint8_t *data, size_t len) override
+    {
+        if (len == 0 || len > MAX_FRAME || !canWrite())
+            return 0;
+        tx[txHead].len = (uint8_t)len;
+        memcpy(tx[txHead].data, data, len);
+        txHead = (uint8_t)((txHead + 1) % QUEUE);
+        return len;
+    }
+
+    size_t readFrame(uint8_t *dest) override
+    {
+        if (rxTail == rxHead)
+            return 0;
+        const size_t len = rx[rxTail].len;
+        memcpy(dest, rx[rxTail].data, len);
+        rxTail = (uint8_t)((rxTail + 1) % QUEUE);
+        return len;
+    }
+
+    void loop() override
+    {
+        if (txTail == txHead)
+            return;
+        if (!isConnected() || !txCharacteristic) {
+            txTail = txHead; // nobody to tell; the mesh keeps what matters for the next connection
+            return;
+        }
+        if (millis() - lastNotifyMs < 30) // one frame per connection interval or so
+            return;
+        txCharacteristic->setValue(tx[txTail].data, tx[txTail].len);
+        txCharacteristic->notify();
+        txTail = (uint8_t)((txTail + 1) % QUEUE);
+        lastNotifyMs = millis();
+    }
+};
+
+static MeshCoreBleLink meshCoreBleLink;
+#endif
+
 class NimbleBluetoothToRadioCallback : public BLECharacteristicCallbacks
 {
     void onWrite(BLECharacteristic *pCharacteristic) override
@@ -687,6 +779,15 @@ class NimbleBluetoothSecurityCallback : public BLESecurityCallbacks
             });
         }
 #endif
+#if SCREEN_HAS_OWN_QUEUE
+        // The colour UI has a pairing screen only in its programming mode; in normal use the code arrives as a message.
+        if (!screen && service) {
+            char line[48];
+            snprintf(line, sizeof(line), "Bluetooth pairing code: %03u %03u", (unsigned)(passkey / 1000),
+                     (unsigned)(passkey % 1000));
+            service->showOnScreen(line);
+        }
+#endif
         passkeyShowing = true;
     }
     void onAuthenticationComplete(ble_gap_conn_desc *desc) override
@@ -781,6 +882,9 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
         clearPairingDisplay();
 
         resetBleSessionState();
+#if MESHCORE_COEXIST
+        meshCoreBleLink.onDisconnect();
+#endif
 
         // Defer the advertising restart to runOnce (see pendingStartAdvertising): calling
         // startAdvertising() here would crash if this disconnect was a host reset.
@@ -804,7 +908,20 @@ void NimbleBluetooth::startAdvertising()
     // }
 
     BLEAdvertisementData scan = BLEAdvertisementData();
+#if MESHCORE_COEXIST
+    // The MeshCore app looks for its service UUID. The advertisement is full with ours, so it goes in the scan
+    // response, which leaves 11 bytes of name beside it.
+    scan.setCompleteServices(BLEUUID(MESHCORE_NUS_SERVICE_UUID));
+    {
+        String name = getDeviceName();
+        if (name.length() <= 11)
+            scan.setName(name);
+        else // keep the "_abcd" that tells two nodes apart: "Meshtastic_abcd" becomes "Meshta_abcd"
+            scan.setShortName(name.substring(0, 6) + name.substring(name.length() - 5));
+    }
+#else
     scan.setName(getDeviceName());
+#endif
     pAdvertising->setScanResponseData(scan);
     pAdvertising->setMinPreferred(0x06); // functions that help with iPhone connections issue
     pAdvertising->setMaxPreferred(0x12);
@@ -1022,6 +1139,23 @@ void NimbleBluetooth::setupService()
     logRadioCharacteristic->setCallbacks(&logRadioCallbacks);
 
     bleService->start();
+
+#if MESHCORE_COEXIST
+    {
+        BLEService *mcService = bleServer->createService(MESHCORE_NUS_SERVICE_UUID);
+        uint32_t rxProps = BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR;
+        uint32_t txProps = BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ;
+        if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_NO_PIN) {
+            rxProps |= BLECharacteristic::PROPERTY_WRITE_AUTHEN | BLECharacteristic::PROPERTY_WRITE_ENC;
+            txProps |= BLECharacteristic::PROPERTY_READ_AUTHEN | BLECharacteristic::PROPERTY_READ_ENC;
+        }
+        BLECharacteristic *mcRx = mcService->createCharacteristic(MESHCORE_NUS_RX_UUID, rxProps);
+        meshCoreBleLink.txCharacteristic = mcService->createCharacteristic(MESHCORE_NUS_TX_UUID, txProps);
+        mcRx->setCallbacks(&meshCoreBleLink);
+        mcService->start();
+        meshcore_host::setBleLink(&meshCoreBleLink);
+    }
+#endif
 
     // Setup the battery service
     BLEService *batteryService = bleServer->createService(BLEUUID((uint16_t)0x180f)); // 0x180F is the Battery Service

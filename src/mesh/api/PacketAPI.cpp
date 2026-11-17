@@ -36,7 +36,9 @@ PacketAPI::PacketAPI(PacketServer *_server)
 int32_t PacketAPI::runOnce()
 {
     bool success = false;
-#ifndef ARCH_PORTDUINO
+#if !defined(ARCH_PORTDUINO) && !SCREEN_HAS_OWN_QUEUE
+    // With its own queue the screen keeps running beside a Bluetooth client. Its programming mode is still there for
+    // whoever asks for it on the boot screen; it is only no longer forced.
     if (config.bluetooth.enabled) {
         if (!programmingMode) {
             // in programmingMode we don't send any packets to the client except this one notify
@@ -117,6 +119,13 @@ bool PacketAPI::sendPacket(void)
     }
     return false;
 }
+
+#if SCREEN_HAS_OWN_QUEUE
+meshtastic_MeshPacket *PacketAPI::nextMeshPacket()
+{
+    return service->getForScreen();
+}
+#endif
 
 bool PacketAPI::notifyProgrammingMode(void)
 {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "MeshService.h"
 #include "PhoneAPI.h"
 #include "comms/PacketServer.h"
 #include "concurrency/OSThread.h"
@@ -23,6 +24,10 @@ class PacketAPI : public PhoneAPI, public concurrency::OSThread
 
     void onNowHasData(uint32_t fromRadioNum) override {}
     void onConnectionChanged(bool connected) override {}
+#if SCREEN_HAS_OWN_QUEUE
+    meshtastic_MeshPacket *nextMeshPacket() override;
+    bool takesPhoneExtras() override { return false; }
+#endif
 
   private:
     bool receivePacket(void);
