@@ -46,6 +46,11 @@ class LockingArduinoHal : public ArduinoHal
 
     void spiBeginTransaction() override;
     void spiEndTransaction() override;
+#if MESHCORE_COEXIST
+    /// The task that holds spiLock itself across a burst of radio commands (the side channel's look, see SideChannel.h):
+    /// its transfers go through without taking the lock again. Set and cleared by that task while it holds the lock.
+    static void *busHolder;
+#endif
 #if ARCH_PORTDUINO
     void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override;
 

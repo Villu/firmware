@@ -6,6 +6,8 @@
 // driver's ordinary RX start. The whole excursion runs under the radio-sequence lock with DIO1 masked, so neither the
 // radio thread nor the readout task sees the chip anywhere but at home.
 
+#include "SPILock.h"
+
 namespace
 {
 // Flags a side excursion reads by polling; nothing is routed to DIO1 while away
@@ -71,14 +73,15 @@ uint32_t sideCadMs(const SideChannelConfig &c)
     return (sideSymbolUs(c.sf, c.bwKHz) * (sideCadSymbols(c.sf) + 1u)) / 1000 + 1;
 }
 
-// How long to stay home between looks: a look has to start early enough in a side preamble for the scan and then the
-// receiver's lock (eight symbols, generously) to fit in what is left of it.
+// How long to stay home between looks. A frame whose preamble began just after one scan is found by the next, which
+// ends a dwell, a look's retuning and a scan later: eight symbols of the preamble proper (the sync symbols behind it
+// do not count) must still be left then for the receiver to lock on.
 uint32_t sideHomeDwellMs(const SideChannelConfig &c)
 {
     const uint32_t symUs = sideSymbolUs(c.sf, c.bwKHz);
-    const int32_t preambleMs = (int32_t)((symUs * (c.preamble + 4u)) / 1000);
+    const int32_t preambleMs = (int32_t)((symUs * c.preamble) / 1000);
     const int32_t lockMs = (int32_t)((symUs * (sideCadSymbols(c.sf) + 8u)) / 1000);
-    const int32_t ms = preambleMs - lockMs - (int32_t)sideCadMs(c) - 20;
+    const int32_t ms = preambleMs - lockMs - (int32_t)sideCadMs(c) - 10;
     return ms < 20 ? 20u : (uint32_t)ms;
 }
 } // namespace
@@ -138,19 +141,22 @@ template <typename T> bool SX126xInterface<T>::sideChannelStart(const SideChanne
     sideEnabled = true;
     LOG_INFO("Side channel: %.3f MHz, SF%u, %.1f kHz, CR 4/%u, sync 0x%02x, preamble %u; a %u-symbol look every %u ms",
              cfg.freqMHz, cfg.sf, cfg.bwKHz, cfg.cr, cfg.syncWord, cfg.preamble, sideCadSymbols(cfg.sf),
-             (unsigned)(sideHomeDwellMs(cfg) + sideCadMs(cfg)));
+             (unsigned)(sideHomeDwellMs(cfg) + sideCadMs(cfg) + 3));
     return true;
 }
 
 template <typename T> bool SX126xInterface<T>::sideChannelSend(const uint8_t *data, size_t len)
 {
-    if (!sideEnabled || !sideTask || len == 0 || len > sizeof(sideTxBuf) || sideTxState == SIDE_TX_PENDING)
+    const uint8_t state = sideTxState;
+    if (!sideEnabled || !sideTask || len == 0 || len > sizeof(sideTxBuf) || state == SIDE_TX_PENDING ||
+        state == SIDE_TX_SENDING)
         return false;
     if (disabled || !config.lora.tx_enabled || config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET)
         return false;
     memcpy(sideTxBuf, data, len);
     sideTxLen = (uint16_t)len;
     sideTxState = SIDE_TX_PENDING; // last: the task takes the frame once it sees this
+    xTaskNotifyGive(sideTask);     // and looks at once, not at the end of its dwell: the sender is timing this
     return true;
 }
 
@@ -160,7 +166,8 @@ template <typename T> bool SX126xInterface<T>::sideChannelTakeSendResult(bool &o
     if (state != SIDE_TX_SENT && state != SIDE_TX_FAILED)
         return false;
     ok = state == SIDE_TX_SENT;
-    sideTxState = SIDE_TX_IDLE;
+    uint8_t taken = state;
+    sideTxState.compare_exchange_strong(taken, SIDE_TX_IDLE);
     return true;
 }
 
@@ -189,8 +196,8 @@ template <typename T> void SX126xInterface<T>::sideTaskLoop()
                          sf, bw);
         }
         if (!fits) {
-            if (sideTxState == SIDE_TX_PENDING)
-                sideTxState = SIDE_TX_FAILED;
+            uint8_t waiting = SIDE_TX_PENDING;
+            sideTxState.compare_exchange_strong(waiting, SIDE_TX_FAILED);
             vTaskDelay(pdMS_TO_TICKS(50));
             homeSince = millis();
             continue;
@@ -198,8 +205,9 @@ template <typename T> void SX126xInterface<T>::sideTaskLoop()
         const uint32_t dwell = sideHomeDwellMs(sideCfg);
         const uint32_t waited = millis() - homeSince;
         if (waited < dwell) {
-            vTaskDelay(pdMS_TO_TICKS(dwell - waited));
-            continue;
+            // Woken early by a frame handed in for sending: it goes out after a look made right now
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(dwell - waited)) == 0 || sideTxState != SIDE_TX_PENDING)
+                continue;
         }
         const SideLook result = sideLook();
         sideHomeBusy = result != SIDE_LOOK_DONE;
@@ -227,23 +235,63 @@ template <typename T> typename SX126xInterface<T>::SideLook SX126xInterface<T>::
 
     const uint16_t irq = lora.getIrqFlags();
     // A frame is arriving or waits to be read out
-    if (irq & (RADIOLIB_SX126X_IRQ_RX_DONE | RADIOLIB_SX126X_IRQ_CRC_ERR | RADIOLIB_SX126X_IRQ_HEADER_VALID))
+    if (irq & (RADIOLIB_SX126X_IRQ_RX_DONE | RADIOLIB_SX126X_IRQ_CRC_ERR | RADIOLIB_SX126X_IRQ_HEADER_VALID)) {
+        sideBareSince = 0;
         return SIDE_LOOK_HOME_BUSY;
+    }
+    // A bare preamble may be a home frame starting, and a look now would come back after its preamble: no look until
+    // its header would have shown. Meshtastic's transmit path holds on the same flag and clears it on sight too, so
+    // whichever of the two reads it first has to tell the other: here through the stock hold, in both directions.
+    // Bare preambles with never a header behind them (noise, or LoRa that is not ours) put looks off for four such
+    // waits at most; after that they are looked past until the flag has been quiet once.
     const uint32_t now = millis();
+    const uint32_t graceMs = preambleHeaderGraceMsec(sf, bw, preambleLength);
+    const bool capped = sideBareSince && now - sideBareSince >= 4 * graceMs;
     if (irq & RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED) {
-        // A home frame may be starting. A look now would return after its preamble, so wait until its header would
-        // have shown: what is left of the preamble, the sync symbols and the header. Cleared so a later one shows.
-        lora.clearIrqFlags(RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED);
-        const uint32_t symUs = sideSymbolUs(sf, bw);
-        sideHomeHoldUntil = now + (symUs * (preambleLength + 10u)) / 1000 + 4;
-        return SIDE_LOOK_HOME_BUSY;
-    }
-    if (sideHomeHoldUntil) {
-        if ((int32_t)(sideHomeHoldUntil - now) > 0)
+        if (!preambleHoldActive())
+            holdOnPreamble(); // clears the flag and holds Meshtastic's transmissions, as its own look would have
+        else
+            lora.clearIrqFlags(RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED); // a hold is running; this sighting is new to us
+        if (!sideBareSince)
+            sideBareSince = now ? now : 1;
+        if (!capped) {
+            sideHomeHoldUntil = now + graceMs;
             return SIDE_LOOK_HOME_BUSY;
+        }
         sideHomeHoldUntil = 0;
+    } else {
+        if (!capped && preambleHoldActive() && !preambleHoldHeaderSeen &&
+            Throttle::isWithinTimespanMs(preambleHoldStart, graceMs)) {
+            // The transmit path saw a preamble first and cleared it
+            if (!sideBareSince)
+                sideBareSince = now ? now : 1;
+            return SIDE_LOOK_HOME_BUSY;
+        }
+        if (sideHomeHoldUntil && (int32_t)(sideHomeHoldUntil - now) > 0)
+            return SIDE_LOOK_HOME_BUSY;
+        sideBareSince = 0; // quiet
     }
+    sideHomeHoldUntil = 0;
     return SIDE_LOOK_DONE;
+}
+
+// The display, the SD card and the radio share one SPI bus behind spiLock, taken per transfer. A look is some twenty
+// transfers, and the display getting in between two of them keeps the radio off the home network for as long as it
+// draws. So a look takes the bus once, before it leaves home, and keeps it until the radio is back.
+template <typename T> void SX126xInterface<T>::sideBusTake()
+{
+    spiLock->lock();
+    LockingArduinoHal::busHolder = (void *)xTaskGetCurrentTaskHandle();
+    sideBusHeld = true;
+}
+
+template <typename T> void SX126xInterface<T>::sideBusRelease()
+{
+    if (!sideBusHeld)
+        return;
+    sideBusHeld = false;
+    LockingArduinoHal::busHolder = nullptr;
+    spiLock->unlock();
 }
 
 template <typename T> int16_t SX126xInterface<T>::sideStandby()
@@ -281,9 +329,12 @@ template <typename T> int16_t SX126xInterface<T>::sidePacketParams(uint16_t prea
 template <typename T> typename SX126xInterface<T>::SideLook SX126xInterface<T>::sideLook()
 {
     RadioSequence seq(this);
+    sideBusTake(); // waited for at home
     const SideLook home = sideHomeState();
-    if (home != SIDE_LOOK_DONE)
+    if (home != SIDE_LOOK_DONE) {
+        sideBusRelease();
         return home;
+    }
 
     const SideChannelConfig c = sideCfg;
     const uint32_t t0 = micros();
@@ -295,6 +346,7 @@ template <typename T> typename SX126xInterface<T>::SideLook SX126xInterface<T>::
         const uint8_t forever[3] = {0xFF, 0xFF, 0xFF};
         module.SPIwriteStream(RADIOLIB_SX126X_CMD_SET_RX, forever, sizeof(forever));
         sideChannelAway = false;
+        sideBusRelease();
         return SIDE_LOOK_HOME_BUSY;
     }
 
@@ -330,14 +382,16 @@ template <typename T> typename SX126xInterface<T>::SideLook SX126xInterface<T>::
     uint16_t irq = 0;
     if (err == RADIOLIB_ERR_NONE) {
         sideStats.looks++;
-        const uint32_t cadMs = sideCadMs(c);
-        vTaskDelay(pdMS_TO_TICKS(cadMs));
-        for (uint32_t extra = 0; extra < 30; extra++) {
+        // The scan takes its symbols and then the chip's own reckoning: sleep through the symbols, then ask every ms
+        const uint32_t cadStart = micros();
+        vTaskDelay(pdMS_TO_TICKS((sideSymbolUs(c.sf, c.bwKHz) * sideCadSymbols(c.sf)) / 1000));
+        for (uint32_t extra = 0; extra < 40; extra++) {
             irq = lora.getIrqFlags();
             if (irq & RADIOLIB_SX126X_IRQ_CAD_DONE)
                 break;
             vTaskDelay(1);
         }
+        sideStats.cadUsLast = micros() - cadStart;
     }
 
     bool empty = true;
@@ -345,20 +399,25 @@ template <typename T> typename SX126xInterface<T>::SideLook SX126xInterface<T>::
         empty = false;
         sideStats.cadHits++;
         lora.clearIrqFlags(RADIOLIB_SX126X_IRQ_CAD_DONE | RADIOLIB_SX126X_IRQ_CAD_DETECTED);
+        sideBusRelease(); // a frame takes long: the display may draw between the polls
         sideRxActive = true;
         sideCatchFrame(c);
         sideRxActive = false;
     } else if ((irq & RADIOLIB_SX126X_IRQ_CAD_DONE) && sideTxState == SIDE_TX_PENDING) {
         empty = false;
+        sideBusRelease();
         sideTransmit(c); // the scan just found the channel clear
     }
 
     sideGoHome();
+    sideBusRelease();
     if (empty) {
         const uint32_t us = micros() - t0;
         sideStats.lookUsLast = us;
         if (us > sideStats.lookUsMax)
             sideStats.lookUsMax = us;
+        if (us > 20000)
+            sideStats.looksLong++;
     }
     return SIDE_LOOK_DONE;
 }
@@ -419,7 +478,9 @@ template <typename T> void SX126xInterface<T>::sideCatchFrame(const SideChannelC
 template <typename T> void SX126xInterface<T>::sideTransmit(const SideChannelConfig &c)
 {
     const uint16_t len = sideTxLen;
-    if (sideTxState != SIDE_TX_PENDING || len == 0) // cancelled meanwhile
+    // From here the frame is on its way: a cancel no longer reaches it, and a new frame is not taken until it is done
+    uint8_t waiting = SIDE_TX_PENDING;
+    if (len == 0 || !sideTxState.compare_exchange_strong(waiting, SIDE_TX_SENDING)) // cancelled meanwhile
         return;
     int16_t err = sideStandby();
     if (err == RADIOLIB_ERR_NONE)
@@ -477,7 +538,7 @@ template <typename T> void SX126xInterface<T>::sideTransmit(const SideChannelCon
     else
         sideStats.txFail++;
     sideTxLen = 0;
-    sideTxState = sent ? SIDE_TX_SENT : SIDE_TX_FAILED;
+    sideTxState = (uint8_t)(sent ? SIDE_TX_SENT : SIDE_TX_FAILED);
 }
 
 template <typename T> void SX126xInterface<T>::sideGoHome()

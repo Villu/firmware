@@ -18,9 +18,17 @@
 #include "meshUtils.h"
 #endif
 
+#if MESHCORE_COEXIST
+void *LockingArduinoHal::busHolder = nullptr;
+#define HOLDS_BUS() (busHolder && busHolder == (void *)xTaskGetCurrentTaskHandle())
+#else
+#define HOLDS_BUS() false
+#endif
+
 void LockingArduinoHal::spiBeginTransaction()
 {
-    spiLock->lock();
+    if (!HOLDS_BUS())
+        spiLock->lock();
 
     ArduinoHal::spiBeginTransaction();
 }
@@ -29,7 +37,8 @@ void LockingArduinoHal::spiEndTransaction()
 {
     ArduinoHal::spiEndTransaction();
 
-    spiLock->unlock();
+    if (!HOLDS_BUS())
+        spiLock->unlock();
 }
 
 #if ARCH_PORTDUINO

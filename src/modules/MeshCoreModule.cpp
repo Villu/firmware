@@ -8,6 +8,7 @@
 #include "PowerStatus.h"
 #include "Router.h"
 #include "RoutingModule.h"
+#include "Throttle.h"
 #include "airtime.h"
 #include "gps/RTC.h"
 #include "main.h"
@@ -185,6 +186,17 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
     }
     bool radioSend(const uint8_t *data, size_t len) override
     {
+        // Both networks transmit in the same band and share its duty cycle. Meshtastic's router stops at the limit;
+        // MeshCore's own airtime budget knows nothing of Meshtastic's share, so the same test is made here.
+        const float limit = getEffectiveDutyCycle();
+        if (!config.lora.override_duty_cycle && limit < 100 && airTime->utilizationTXPercent() > limit) {
+            static uint32_t lastLogMs;
+            if (!lastLogMs || !Throttle::isWithinTimespanMs(lastLogMs, 60 * 1000UL)) {
+                LOG_WARN("MeshCore: not sent, this hour's share of the band (%.0f %%) is used up", limit);
+                lastLogMs = millis() | 1;
+            }
+            return false;
+        }
         if (!radio->sideChannelSend(data, len))
             return false;
         sendingMs = radio->sideChannelAirtimeMs(len);
@@ -377,9 +389,10 @@ int32_t MeshCoreModule::runOnce()
         host.radio->sideChannelGetStats(s);
         meshcore_host::Status st;
         meshcore_host::getStatus(st);
-        LOG_INFO("MeshCore: %u looks (last %u us, max %u us), %u hits, %u frames, %u bad, %u/%u no preamble/header, "
-                 "%u put off; sent %u, failed %u; %d contacts, app %s",
-                 (unsigned)s.looks, (unsigned)s.lookUsLast, (unsigned)s.lookUsMax, (unsigned)s.cadHits, (unsigned)s.frames,
+        LOG_INFO("MeshCore: %u looks (last %u us, max %u us, %u over 20 ms, scan %u us), %u hits, %u frames, %u bad, "
+                 "%u/%u no preamble/header, %u put off; sent %u, failed %u; %d contacts, app %s",
+                 (unsigned)s.looks, (unsigned)s.lookUsLast, (unsigned)s.lookUsMax, (unsigned)s.looksLong,
+                 (unsigned)s.cadUsLast, (unsigned)s.cadHits, (unsigned)s.frames,
                  (unsigned)s.crcErrors, (unsigned)s.noPreamble, (unsigned)s.noHeader, (unsigned)s.homeBusy, (unsigned)s.txOk,
                  (unsigned)s.txFail, st.contacts, st.appConnected ? "connected" : "not connected");
     }

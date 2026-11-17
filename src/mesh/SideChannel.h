@@ -39,6 +39,8 @@ struct SideChannelStats {
     uint32_t homeBusy;    // looks put off because a home frame was arriving
     uint32_t lookUsLast;  // how long the last empty look kept the radio off the home settings
     uint32_t lookUsMax;   // ...and the longest so far
+    uint32_t looksLong;   // empty looks that took over 20 ms
+    uint32_t cadUsLast;   // from starting the last scan to seeing it done
     uint32_t homeRestoreFail;
 };
 

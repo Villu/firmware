@@ -8,6 +8,7 @@
 #if MESHCORE_COEXIST && defined(MESHTASTIC_RX_READOUT_TASK)
 #define SX126X_SIDE_CHANNEL
 #include "SideChannel.h"
+#include <atomic>
 #endif
 
 // After TX_DONE the SX126x waits in standby for the radio thread to restart RX, which a main-loop hold can stretch by
@@ -205,8 +206,9 @@ class SX126xInterface : public RadioLibInterface
     bool sideChannelRecv(SideChannelFrame &out) override;
     void sideChannelCancelSend() override
     {
-        if (sideTxState == SIDE_TX_PENDING)
-            sideTxState = SIDE_TX_IDLE;
+        // Only a frame that has not started to go out: one on the air finishes, and its result is its own
+        uint8_t waiting = SIDE_TX_PENDING;
+        sideTxState.compare_exchange_strong(waiting, SIDE_TX_IDLE);
     }
     bool sideChannelReceiving() const override { return sideRxActive || sideHomeBusy; }
     void sideChannelGetStats(SideChannelStats &out) const override { out = sideStats; }
@@ -215,7 +217,7 @@ class SX126xInterface : public RadioLibInterface
 
   private:
     enum SideLook : uint8_t { SIDE_LOOK_DONE, SIDE_LOOK_HOME_BUSY, SIDE_LOOK_RADIO_OFF };
-    enum SideTxState : uint8_t { SIDE_TX_IDLE, SIDE_TX_PENDING, SIDE_TX_SENT, SIDE_TX_FAILED };
+    enum SideTxState : uint8_t { SIDE_TX_IDLE, SIDE_TX_PENDING, SIDE_TX_SENDING, SIDE_TX_SENT, SIDE_TX_FAILED };
 
     SideChannelConfig sideCfg = {};
     volatile bool sideEnabled = false;
@@ -226,9 +228,13 @@ class SX126xInterface : public RadioLibInterface
     QueueHandle_t sideRxQueue = nullptr;
     uint8_t sideTxBuf[255];
     volatile uint16_t sideTxLen = 0;
-    volatile uint8_t sideTxState = SIDE_TX_IDLE;
+    std::atomic<uint8_t> sideTxState{SIDE_TX_IDLE};
     /** A bare preamble was seen at home: no look until its header would have shown */
     uint32_t sideHomeHoldUntil = 0;
+    /** Since when bare preambles have been putting looks off with no header behind any of them, or 0 */
+    uint32_t sideBareSince = 0;
+    /** This task holds spiLock across the commands of a look (LockingArduinoHal::busHolder) */
+    bool sideBusHeld = false;
     SideChannelStats sideStats = {};
 
     static void sideTaskMain(void *arg);
@@ -239,6 +245,8 @@ class SX126xInterface : public RadioLibInterface
     void sideCatchFrame(const SideChannelConfig &c);
     void sideTransmit(const SideChannelConfig &c);
     void sideGoHome();
+    void sideBusTake();
+    void sideBusRelease();
     int16_t sideStandby();
     int16_t sideTune(float freqMHz, float bwKHz, uint8_t sfv, uint8_t crv, uint8_t sw);
     int16_t sidePacketParams(uint16_t preamble, uint8_t len);
