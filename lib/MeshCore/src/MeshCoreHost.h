@@ -22,6 +22,9 @@ class Platform
 {
   public:
     // --- radio: one LoRa channel that carries whole frames ---
+    /// Whether the host's radio may be put on these settings (its band plan, and what its radio sharing can do).
+    /// Asked before the app's choice is stored, and again before tuning.
+    virtual bool radioParamsAllowed(float freqMHz, float bwKHz, uint8_t sf, uint8_t cr) { return true; }
     /// Tune the MeshCore channel
     virtual void radioSetParams(float freqMHz, float bwKHz, uint8_t sf, uint8_t cr) = 0;
     /// Hand over one frame to send; false if it cannot be taken now

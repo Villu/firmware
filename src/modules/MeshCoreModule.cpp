@@ -12,6 +12,7 @@
 #include "gps/RTC.h"
 #include "main.h"
 #include "mesh/Channels.h"
+#include "mesh/MeshRadio.h"
 #include "mesh/SideChannel.h"
 #include "mesh/generated/meshtastic/mesh.pb.h"
 #include <MeshCoreHost.h>
@@ -155,7 +156,7 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
     SideChannelRadio *radio = nullptr;
 
     // ---- Platform: radio ----
-    void radioSetParams(float freqMHz, float bwKHz, uint8_t sf, uint8_t cr) override
+    static SideChannelConfig sideConfig(float freqMHz, float bwKHz, uint8_t sf, uint8_t cr)
     {
         SideChannelConfig cfg = {};
         cfg.freqMHz = freqMHz;
@@ -164,7 +165,22 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
         cfg.cr = cr;
         cfg.syncWord = MESHCORE_SYNC_WORD;
         cfg.preamble = sf <= 8 ? 32 : 16; // MeshCore's rule: the fast settings get the long preamble
-        if (!radio->sideChannelStart(cfg))
+        return cfg;
+    }
+    bool radioParamsAllowed(float freqMHz, float bwKHz, uint8_t sf, uint8_t cr) override
+    {
+        // MeshCore goes out through Meshtastic's radio at Meshtastic's power: only inside Meshtastic's region
+        if (!myRegion || freqMHz - bwKHz / 2000.0f < myRegion->freqStart || freqMHz + bwKHz / 2000.0f > myRegion->freqEnd)
+            return false;
+        return radio && radio->sideChannelFits(sideConfig(freqMHz, bwKHz, sf, cr));
+    }
+    void radioSetParams(float freqMHz, float bwKHz, uint8_t sf, uint8_t cr) override
+    {
+        const SideChannelConfig cfg = sideConfig(freqMHz, bwKHz, sf, cr);
+        if (!radioParamsAllowed(freqMHz, bwKHz, sf, cr))
+            LOG_ERROR("MeshCore: %.3f MHz SF%u %.1f kHz is outside the region's band or does not fit beside Meshtastic",
+                      freqMHz, sf, bwKHz);
+        else if (!radio->sideChannelStart(cfg))
             LOG_ERROR("MeshCore: the radio did not take %.3f MHz SF%u %.1f kHz", freqMHz, sf, bwKHz);
     }
     bool radioSend(const uint8_t *data, size_t len) override

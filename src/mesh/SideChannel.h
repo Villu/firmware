@@ -48,7 +48,10 @@ class SideChannelRadio
     /// The radio driver that can do this, or null
     static SideChannelRadio *instance;
 
-    /// Start looking at (or move to) these settings. False if the driver could not start.
+    /// Whether these settings can share the radio with the home network as it is set now: a look has to be short
+    /// against a home preamble, and the looks must not take too much of the home network's listening time
+    virtual bool sideChannelFits(const SideChannelConfig &cfg) const = 0;
+    /// Start looking at (or move to) these settings. False if they do not fit or the driver could not start.
     virtual bool sideChannelStart(const SideChannelConfig &cfg) = 0;
     virtual void sideChannelStop() = 0;
     virtual bool sideChannelRunning() const = 0;

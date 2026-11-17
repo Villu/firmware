@@ -115,6 +115,53 @@ class LinkAdapter : public BaseSerialInterface
     size_t checkRecvFrame(uint8_t dest[]) override { return _enabled ? _link->readFrame(dest) : 0; }
 };
 
+// A link without pairing or encryption (TCP): anyone on the network can open it. It carries the app's everyday traffic,
+// but not the commands that hand out or replace the node's identity, sign with it, wipe or restart the node, or run
+// its command line. Those are answered "disabled", as a build without them would.
+class OpenLinkGuard : public BaseSerialInterface
+{
+    BaseSerialInterface *_inner;
+
+    // Command and response codes of the companion protocol (companion/MyMesh.cpp)
+    static bool refused(uint8_t cmd)
+    {
+        switch (cmd) {
+        case 19: // CMD_REBOOT
+        case 23: // CMD_EXPORT_PRIVATE_KEY
+        case 24: // CMD_IMPORT_PRIVATE_KEY
+        case 33: // CMD_SIGN_START
+        case 34: // CMD_SIGN_DATA
+        case 35: // CMD_SIGN_FINISH
+        case 37: // CMD_SET_DEVICE_PIN
+        case 51: // CMD_FACTORY_RESET
+        case 66: // CMD_RUN_CLI_COMMAND
+            return true;
+        default:
+            return false;
+        }
+    }
+
+  public:
+    explicit OpenLinkGuard(BaseSerialInterface *inner) : _inner(inner) {}
+    void enable() override { _inner->enable(); }
+    void disable() override { _inner->disable(); }
+    bool isEnabled() const override { return _inner->isEnabled(); }
+    bool isConnected() const override { return _inner->isConnected(); }
+    void loop() override { _inner->loop(); }
+    bool isWriteBusy() const override { return _inner->isWriteBusy(); }
+    size_t writeFrame(const uint8_t src[], size_t len) override { return _inner->writeFrame(src, len); }
+    size_t checkRecvFrame(uint8_t dest[]) override
+    {
+        const size_t len = _inner->checkRecvFrame(dest);
+        if (len == 0 || !refused(dest[0]))
+            return len;
+        logf("MeshCore: command %u refused on the TCP link (Bluetooth only)", dest[0]);
+        const uint8_t disabled[1] = {15}; // RESP_CODE_DISABLED
+        _inner->writeFrame(disabled, sizeof(disabled));
+        return 0;
+    }
+};
+
 LinkAdapter *ble_adapter = nullptr;
 SerialWifiInterface *tcp_link = nullptr;
 uint16_t tcp_port = 0;
@@ -229,7 +276,7 @@ void loop()
     if (tcp_port && !tcp_started && WiFi.status() == WL_CONNECTED) {
         tcp_link = new SerialWifiInterface();
         tcp_link->begin(tcp_port);
-        links.addInterface(InterfaceType::WiFi, tcp_link);
+        links.addInterface(InterfaceType::WiFi, new OpenLinkGuard(tcp_link));
         tcp_link->enable();
         tcp_started = true;
         logf("MeshCore: app link on TCP port %u", tcp_port);
@@ -365,6 +412,12 @@ bool storageErase()
 }
 
 } // namespace meshcore_host
+
+// Asked by the vendored MyMesh before it stores radio settings from the app (see MESHCORE_HOSTED there)
+bool mc_host_radio_params_ok(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr)
+{
+    return !meshcore_host::platform || meshcore_host::platform->radioParamsAllowed(freq_mhz, bw_khz, sf, cr);
+}
 
 uint32_t mc_host_storage_used_kb()
 {

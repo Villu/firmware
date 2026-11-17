@@ -196,6 +196,7 @@ class SX126xInterface : public RadioLibInterface
 
 #ifdef SX126X_SIDE_CHANNEL
   public:
+    bool sideChannelFits(const SideChannelConfig &cfg) const override;
     bool sideChannelStart(const SideChannelConfig &cfg) override;
     void sideChannelStop() override { sideEnabled = false; }
     bool sideChannelRunning() const override { return sideEnabled && sideTask; }
@@ -220,6 +221,7 @@ class SX126xInterface : public RadioLibInterface
     volatile bool sideEnabled = false;
     volatile bool sideRxActive = false;
     volatile bool sideHomeBusy = false; // the last look was put off
+    bool sideSuspended = false;         // the home settings changed to ones the looks do not fit
     TaskHandle_t sideTask = nullptr;
     QueueHandle_t sideRxQueue = nullptr;
     uint8_t sideTxBuf[255];

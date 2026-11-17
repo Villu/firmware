@@ -39,6 +39,17 @@ void HostBoard::reboot()
 
 void HostRadio::setParams(float freq, float bw, uint8_t sf, uint8_t cr)
 {
+    // Stored settings the host does not allow (from before it checked, or its own radio plan changed): the defaults
+    if (platform && !platform->radioParamsAllowed(freq, bw, sf, cr)) {
+        char line[120];
+        snprintf(line, sizeof(line), "MeshCore: %.3f MHz SF%u %.1f kHz is not allowed here, using %.3f MHz SF%u %.1f kHz",
+                 freq, sf, bw, (float)LORA_FREQ, (unsigned)LORA_SF, (float)LORA_BW);
+        platform->log(line);
+        freq = LORA_FREQ;
+        bw = LORA_BW;
+        sf = LORA_SF;
+        cr = LORA_CR;
+    }
     _freq = freq;
     _bw = bw;
     _sf = sf;

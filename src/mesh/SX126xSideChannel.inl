@@ -88,10 +88,24 @@ template <typename T> uint32_t SX126xInterface<T>::sideChannelAirtimeMs(size_t l
     return sideAirtimeMs(sideCfg, len);
 }
 
+template <typename T> bool SX126xInterface<T>::sideChannelFits(const SideChannelConfig &cfg) const
+{
+    if (cfg.sf < 7 || cfg.sf > 12 || cfg.cr < 5 || cfg.cr > 8 || cfg.bwKHz <= 0 || cfg.preamble < 8)
+        return false;
+    // A look (the scan plus about 3 ms of retuning) takes that much of a home preamble away from the home receiver:
+    // past 60 % too little is left for it to lock. And the side preamble has to be long enough that looks which catch
+    // every frame still leave the home network at least 70 % of the time.
+    const uint32_t lookMs = sideCadMs(cfg) + 3;
+    const uint32_t homePreambleMs = (sideSymbolUs(sf, bw) * preambleLength) / 1000;
+    const uint32_t dwellMs = sideHomeDwellMs(cfg);
+    return lookMs * 10 <= homePreambleMs * 6 && dwellMs > 20 && lookMs * 10 <= (dwellMs + lookMs) * 3;
+}
+
 template <typename T> bool SX126xInterface<T>::sideChannelStart(const SideChannelConfig &cfg)
 {
-    if (cfg.sf < 7 || cfg.sf > 12 || cfg.cr < 5 || cfg.cr > 8 || cfg.bwKHz <= 0 || cfg.preamble < 8) {
-        LOG_ERROR("Side channel: settings out of range");
+    if (!sideChannelFits(cfg)) {
+        LOG_ERROR("Side channel: SF%u at %.1f kHz with a preamble of %u does not fit beside the home network (SF%u, %.1f kHz)",
+                  cfg.sf, cfg.bwKHz, cfg.preamble, sf, bw);
         return false;
     }
     {
@@ -164,7 +178,17 @@ template <typename T> void SX126xInterface<T>::sideTaskLoop()
 {
     uint32_t homeSince = millis();
     for (;;) {
-        if (!sideEnabled) {
+        // The home settings can change under a running side channel (another preset): stay home while it does not fit
+        const bool fits = sideEnabled && sideChannelFits(sideCfg);
+        if (sideEnabled && fits == sideSuspended) {
+            sideSuspended = !fits;
+            if (fits)
+                LOG_INFO("Side channel: fits beside the home network again, looking");
+            else
+                LOG_WARN("Side channel: does not fit beside the home network as it is set now (SF%u, %.1f kHz), not looking",
+                         sf, bw);
+        }
+        if (!fits) {
             if (sideTxState == SIDE_TX_PENDING)
                 sideTxState = SIDE_TX_FAILED;
             vTaskDelay(pdMS_TO_TICKS(50));

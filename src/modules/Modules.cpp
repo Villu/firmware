@@ -58,9 +58,9 @@
 #include "modules/TextMessageModule.h"
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
+#endif
 #if MESHCORE_COEXIST
 #include "modules/MeshCoreModule.h"
-#endif
 #endif
 #if !MESHTASTIC_EXCLUDE_WAYPOINT
 #include "modules/GeofenceModule.h"
@@ -179,9 +179,9 @@ void setupModules()
 #endif
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
     traceRouteModule = new TraceRouteModule();
+#endif
 #if MESHCORE_COEXIST
     meshCoreModule = new MeshCoreModule();
-#endif
 #endif
 #if !MESHTASTIC_EXCLUDE_NEIGHBORINFO
     if (moduleConfig.has_neighbor_info && moduleConfig.neighbor_info.enabled) {

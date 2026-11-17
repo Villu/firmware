@@ -1,5 +1,9 @@
 #include "MyMesh.h"
 
+#ifdef MESHCORE_HOSTED
+bool mc_host_radio_params_ok(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr);
+#endif
+
 #include <Arduino.h> // needed for PlatformIO
 #ifdef ENABLE_WIFI_INTERFACE
 #include <WiFi.h>
@@ -1444,6 +1448,10 @@ void MyMesh::handleCmdFrame(size_t len) {
 
     if (repeat && !isValidClientRepeatFreq(freq)) {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+#ifdef MESHCORE_HOSTED
+    } else if (!mc_host_radio_params_ok((float)freq / 1000.0f, (float)bw / 1000.0f, sf, cr)) {
+      writeErrFrame(ERR_CODE_ILLEGAL_ARG);   // outside the host firmware's band, or more than its radio sharing can do
+#endif
     } else if (freq >= 150000 && freq <= 2500000 && sf >= 5 && sf <= 12 && cr >= 5 && cr <= 8 && bw >= 7000 &&
         bw <= 500000) {
       _prefs.sf = sf;
