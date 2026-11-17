@@ -45,6 +45,9 @@ bool sideLdro(uint8_t sf, float bwKHz)
     return sideSymbolUs(sf, bwKHz) >= 16000; // as RadioLib's automatic choice
 }
 
+// How often the home receiver's flags are read while the radio waits at home
+const uint32_t SIDE_GLANCE_MS = 8;
+
 // Semtech's LoRa time-on-air formula (explicit header, CRC on), SF7 and up
 uint32_t sideAirtimeMs(const SideChannelConfig &c, size_t len)
 {
@@ -205,15 +208,35 @@ template <typename T> void SX126xInterface<T>::sideTaskLoop()
         const uint32_t dwell = sideHomeDwellMs(sideCfg);
         const uint32_t waited = millis() - homeSince;
         if (waited < dwell) {
-            // Woken early by a frame handed in for sending: it goes out after a look made right now
-            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(dwell - waited)) == 0 || sideTxState != SIDE_TX_PENDING)
+            // Woken early by a frame handed in for sending: it goes out after a look made right now.
+            // The wait is cut into slices with a glance at the home receiver's flags between them: a preamble
+            // sighting puts the next look off for a header's time, and that has to count from when the preamble
+            // showed, not from when the look fell due up to a dwell later. Counted from then it cost one side frame
+            // in ten: a strong side transmission makes the home receiver report a preamble as it starts, and the
+            // look came after the side preamble was over.
+            const uint32_t left = dwell - waited;
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(left < SIDE_GLANCE_MS ? left : SIDE_GLANCE_MS)) == 0 ||
+                sideTxState != SIDE_TX_PENDING) {
+                if (left > SIDE_GLANCE_MS) {
+                    RadioSequence seq(this);
+                    (void)sideHomeState();
+                }
                 continue;
+            }
         }
         const SideLook result = sideLook();
         sideHomeBusy = result != SIDE_LOOK_DONE;
         switch (result) {
         case SIDE_LOOK_DONE:
             homeSince = millis();
+            // A false alarm kept the radio away for longer than a look: the next scan still comes one period after
+            // the scan that raised it, or a preamble starting behind that scan is over before anything looks again.
+            // Home gets 20 ms at least.
+            if (sideFalseHitMs) {
+                const uint32_t cut = sideFalseHitMs < dwell - 20 ? sideFalseHitMs : dwell - 20;
+                homeSince -= cut;
+                sideFalseHitMs = 0;
+            }
             break;
         case SIDE_LOOK_HOME_BUSY:
             sideStats.homeBusy++;
@@ -380,10 +403,21 @@ template <typename T> typename SX126xInterface<T>::SideLook SX126xInterface<T>::
     }
 
     uint16_t irq = 0;
+    uint32_t scanStartMs = millis();
     if (err == RADIOLIB_ERR_NONE) {
         sideStats.looks++;
         // The scan takes its symbols and then the chip's own reckoning: sleep through the symbols, then ask every ms
         const uint32_t cadStart = micros();
+        const uint32_t nowMs = millis();
+        if (sideLastScanMs) {
+            const uint32_t gap = nowMs - sideLastScanMs;
+            if (gap > sideStats.gapMsMax)
+                sideStats.gapMsMax = gap;
+            if (gap > 100)
+                sideStats.gapsLong++;
+        }
+        sideLastScanMs = nowMs ? nowMs : 1;
+        scanStartMs = nowMs;
         vTaskDelay(pdMS_TO_TICKS((sideSymbolUs(c.sf, c.bwKHz) * sideCadSymbols(c.sf)) / 1000));
         for (uint32_t extra = 0; extra < 40; extra++) {
             irq = lora.getIrqFlags();
@@ -401,16 +435,37 @@ template <typename T> typename SX126xInterface<T>::SideLook SX126xInterface<T>::
         lora.clearIrqFlags(RADIOLIB_SX126X_IRQ_CAD_DONE | RADIOLIB_SX126X_IRQ_CAD_DETECTED);
         sideBusRelease(); // a frame takes long: the display may draw between the polls
         sideRxActive = true;
-        sideCatchFrame(c);
+        const uint32_t strongBefore = sideStats.noPreambleStrong;
+        const bool something = sideCatchFrame(c, scanStartMs);
         sideRxActive = false;
+        const uint32_t tookMs = (micros() - t0) / 1000 + 3; // and the way home
+        if (sideStats.noPreambleStrong != strongBefore) {
+            // Something strong with no preamble. The first time it may be a transmitter keying up, its preamble
+            // about to start: look again as soon as after a false alarm. Again right after that it is a frame
+            // whose preamble was missed, and the home network gets its full share until the channel is clear.
+            sideStats.strongAtMs = scanStartMs;
+            sideStats.strongGapMs = sidePrevScanMs ? scanStartMs - sidePrevScanMs : 0;
+            if (!sideStrongPending)
+                sideFalseHitMs = tookMs;
+            sideStrongPending = true;
+        } else if (!something) {
+            sideFalseHitMs = tookMs;
+        }
     } else if ((irq & RADIOLIB_SX126X_IRQ_CAD_DONE) && sideTxState == SIDE_TX_PENDING) {
         empty = false;
         sideBusRelease();
         sideTransmit(c); // the scan just found the channel clear
     }
+    if (empty && (irq & RADIOLIB_SX126X_IRQ_CAD_DONE) && sideStrongPending) {
+        sideStrongPending = false;
+        sideStats.clearAtMs = scanStartMs;
+    }
+    sidePrevScanMs = scanStartMs;
 
     sideGoHome();
     sideBusRelease();
+    if (!empty)
+        sideLastScanMs = 0; // a frame came or went: the time to the next scan is no gap
     if (empty) {
         const uint32_t us = micros() - t0;
         sideStats.lookUsLast = us;
@@ -422,18 +477,23 @@ template <typename T> typename SX126xInterface<T>::SideLook SX126xInterface<T>::
     return SIDE_LOOK_DONE;
 }
 
-template <typename T> void SX126xInterface<T>::sideCatchFrame(const SideChannelConfig &c)
+template <typename T> bool SX126xInterface<T>::sideCatchFrame(const SideChannelConfig &c, uint32_t scanStartMs)
 {
-    // The chip is in RX on the side settings. A real frame raises PREAMBLE_DETECTED within a few symbols and its
-    // header a preamble later; a hit with neither was noise, and is given up on rather than waited out.
+    // The chip is in RX on the side settings. A real frame raises PREAMBLE_DETECTED some symbols later and its
+    // header a preamble later; a hit with neither was noise, and is given up on rather than waited out. Five
+    // symbols and 6 ms was enough only while the scan was waited out for longer than it takes: measured from the
+    // scan's real end it gave up on four frames in ten.
     const uint32_t symUs = sideSymbolUs(c.sf, c.bwKHz);
-    const uint32_t preambleBy = (symUs * 5u) / 1000 + 6;
+    const uint32_t preambleBy = (symUs * 10u) / 1000 + 6;
     const uint32_t headerBy = (symUs * (c.preamble + 13u)) / 1000 + 20;
     const uint32_t frameBy = sideAirtimeMs(c, 255) + 50;
     const uint32_t start = millis();
     bool preamble = false, header = false;
+    uint32_t preambleAfter = 0;
     for (;;) {
         const uint16_t irq = lora.getIrqFlags();
+        if (!preamble && (irq & (RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID)))
+            preambleAfter = millis() - start;
         if (irq & RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED)
             preamble = true;
         if (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID)
@@ -449,28 +509,38 @@ template <typename T> void SX126xInterface<T>::sideCatchFrame(const SideChannelC
                 frame.snr = lora.getSNR();
                 frame.rssi = (int16_t)lround(lora.getRSSI());
                 sideStats.frames++;
+                const int32_t phase = (int32_t)(scanStartMs - (millis() - sideAirtimeMs(c, len)));
+                sideStats.phaseMsLast = (int16_t)phase;
+                sideStats.phaseHist[phase < 0 ? 0 : phase >= 120 ? 13 : 1 + phase / 10]++;
+                sideStats.preambleMsLast = preambleAfter;
+                if (preambleAfter > sideStats.preambleMsMax)
+                    sideStats.preambleMsMax = preambleAfter;
                 if (xQueueSend(sideRxQueue, &frame, 0) != pdTRUE)
                     sideStats.rxDropped++;
             } else {
                 sideStats.crcErrors++;
             }
-            return;
+            return true;
         }
         if (irq & (RADIOLIB_SX126X_IRQ_HEADER_ERR | RADIOLIB_SX126X_IRQ_TIMEOUT)) {
             sideStats.crcErrors++;
-            return;
+            return true;
         }
         const uint32_t elapsed = millis() - start;
         if (!preamble && elapsed >= preambleBy) {
             sideStats.noPreamble++;
-            return;
+            const float level = lora.getRSSI(false); // right now, not the last packet's
+            sideStats.noPreambleRssi = (int16_t)level;
+            if (level > -95.0f)
+                sideStats.noPreambleStrong++;
+            return false;
         }
         if (!header && elapsed >= headerBy) {
             sideStats.noHeader++;
-            return;
+            return true;
         }
         if (elapsed >= frameBy)
-            return;
+            return true;
         vTaskDelay(pdMS_TO_TICKS(header ? 4 : 2));
     }
 }

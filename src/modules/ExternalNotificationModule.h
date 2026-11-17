@@ -99,6 +99,11 @@ class ExternalNotificationModule : public SinglePortModule, private concurrency:
     void handleSetRingtone(const char *from_msg);
 #endif
 
+#if MESHCORE_COEXIST
+    /// A text that did not come through the router (MeshCore): alert for it as for one that did
+    void alertFor(const meshtastic_MeshPacket &mp) { handleReceived(mp); }
+#endif
+
   protected:
     /** Called to handle a particular incoming message
     @return ProcessMessage::STOP if you've guaranteed you've handled this message and no other handlers should be considered for

@@ -238,6 +238,10 @@ class SX126xInterface : public RadioLibInterface
     uint32_t sideHomeHoldUntil = 0;
     /** Since when bare preambles have been putting looks off with no header behind any of them, or 0 */
     uint32_t sideBareSince = 0;
+    uint32_t sideLastScanMs = 0; // start of the last scan, 0 after a frame
+    uint32_t sidePrevScanMs = 0; // start of the last scan of any kind
+    uint32_t sideFalseHitMs = 0; // how long the last look took if it ended in a false alarm, else 0
+    bool sideStrongPending = false; // a strong hit with no preamble has not been followed by an empty scan yet
     /** This task holds spiLock across the commands of a look (LockingArduinoHal::busHolder) */
     bool sideBusHeld = false;
     SideChannelStats sideStats = {};
@@ -247,7 +251,7 @@ class SX126xInterface : public RadioLibInterface
     /** Whether the home receive is idle, so that leaving it for a look costs nothing */
     SideLook sideHomeState();
     SideLook sideLook();
-    void sideCatchFrame(const SideChannelConfig &c);
+    bool sideCatchFrame(const SideChannelConfig &c, uint32_t scanStartMs);
     void sideTransmit(const SideChannelConfig &c);
     void sideGoHome();
     void sideBusTake();

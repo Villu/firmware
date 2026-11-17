@@ -15,6 +15,9 @@
 #include "gps/RTC.h"
 #include "main.h"
 #include "meshUtils.h"
+#if !MESHTASTIC_EXCLUDE_EXTERNALNOTIFICATION
+#include "modules/ExternalNotificationModule.h"
+#endif
 #include "mesh/Channels.h"
 #include "mesh/MeshRadio.h"
 #include "mesh/SideChannel.h"
@@ -190,6 +193,11 @@ void deliverText(NodeNum from, NodeNum to, uint8_t channel, const char *text, fl
     p->rx_snr = snr;
     p->hop_start = hops;
     p->transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
+#if !MESHTASTIC_EXCLUDE_EXTERNALNOTIFICATION
+    // The sound, light or buzzer a Meshtastic text gets: that module only sees what the router hands it
+    if (externalNotificationModule)
+        externalNotificationModule->alertFor(*p);
+#endif
     service->sendToPhone(p);
 }
 
@@ -491,12 +499,45 @@ int32_t MeshCoreModule::runOnce()
         host.radio->sideChannelGetStats(s);
         meshcore_host::Status st;
         meshcore_host::getStatus(st);
-        LOG_INFO("MeshCore: %u looks (last %u us, max %u us, %u over 20 ms, scan %u us), %u hits, %u frames, %u bad, "
-                 "%u/%u no preamble/header, %u put off; sent %u, failed %u; %d contacts, app %s",
+        // Two lines: the log cuts a long one
+        LOG_INFO("MeshCore: %u looks (last %u us, max %u us, %u over 20 ms, scan %u us, gap max %u ms, %u over 100 ms), "
+                 "%u put off",
                  (unsigned)s.looks, (unsigned)s.lookUsLast, (unsigned)s.lookUsMax, (unsigned)s.looksLong,
-                 (unsigned)s.cadUsLast, (unsigned)s.cadHits, (unsigned)s.frames,
-                 (unsigned)s.crcErrors, (unsigned)s.noPreamble, (unsigned)s.noHeader, (unsigned)s.homeBusy, (unsigned)s.txOk,
-                 (unsigned)s.txFail, st.contacts, st.appConnected ? "connected" : "not connected");
+                 (unsigned)s.cadUsLast, (unsigned)s.gapMsMax, (unsigned)s.gapsLong, (unsigned)s.homeBusy);
+        LOG_INFO("MeshCore: %u hits, %u frames (preamble after %u ms, max %u), %u bad, %u no header, %u no preamble "
+                 "(%u of them strong, last %d dBm); sent %u, failed %u; %d contacts, app %s",
+                 (unsigned)s.cadHits, (unsigned)s.frames, (unsigned)s.preambleMsLast, (unsigned)s.preambleMsMax,
+                 (unsigned)s.crcErrors, (unsigned)s.noHeader, (unsigned)s.noPreamble, (unsigned)s.noPreambleStrong,
+                 (int)s.noPreambleRssi, (unsigned)s.txOk, (unsigned)s.txFail, st.contacts,
+                 st.appConnected ? "connected" : "not connected");
+        LOG_INFO("MeshCore: frames by how far into the preamble the scan began, 10 ms steps from before it: "
+                 "%u %u %u %u %u %u %u %u %u %u %u %u %u %u",
+                 s.phaseHist[0], s.phaseHist[1], s.phaseHist[2], s.phaseHist[3], s.phaseHist[4], s.phaseHist[5],
+                 s.phaseHist[6], s.phaseHist[7], s.phaseHist[8], s.phaseHist[9], s.phaseHist[10], s.phaseHist[11],
+                 s.phaseHist[12], s.phaseHist[13]);
+    }
+    {
+        // A frame that was there and did not arrive, said when it happens
+        static uint32_t lostSeen = 0, framesSeen = 0, clearSeen = 0;
+        SideChannelStats s;
+        host.radio->sideChannelGetStats(s);
+        const uint32_t lost = s.crcErrors + s.noHeader + s.noPreambleStrong;
+        if (lost != lostSeen) {
+            lostSeen = lost;
+            LOG_DEBUG("MeshCore: no frame from a hit: %u bad, %u no header, %u strong with no preamble (%d dBm), scan at "
+                      "%u ms, %u after the one before",
+                      (unsigned)s.crcErrors, (unsigned)s.noHeader, (unsigned)s.noPreambleStrong, (int)s.noPreambleRssi,
+                      (unsigned)s.strongAtMs, (unsigned)s.strongGapMs);
+        }
+        if (s.clearAtMs != clearSeen) {
+            clearSeen = s.clearAtMs;
+            LOG_DEBUG("MeshCore: channel clear again at the scan at %u ms", (unsigned)s.clearAtMs);
+        }
+        if (s.frames != framesSeen) {
+            framesSeen = s.frames;
+            LOG_DEBUG("MeshCore: frame found by a scan %d ms into its preamble, preamble flag %u ms after the hit",
+                      (int)s.phaseMsLast, (unsigned)s.preambleMsLast);
+        }
     }
     return 15;
 }

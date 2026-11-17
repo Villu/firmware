@@ -41,6 +41,17 @@ struct SideChannelStats {
     uint32_t lookUsMax;   // ...and the longest so far
     uint32_t looksLong;   // empty looks that took over 20 ms
     uint32_t cadUsLast;   // from starting the last scan to seeing it done
+    uint32_t preambleMsLast; // from a hit to the receiver's preamble flag, for the last frame that arrived
+    uint32_t preambleMsMax;  // ...and the longest so far
+    uint32_t gapMsMax;       // the longest time between two scans with nothing but home in between
+    uint32_t gapsLong;       // such gaps over 100 ms
+    uint32_t noPreambleStrong; // hits given up on with a signal over -95 dBm on the channel: a frame, not noise
+    int16_t noPreambleRssi;    // the level at the last hit given up on, dBm
+    int16_t phaseMsLast;       // how far into its preamble the last frame was when the scan that found it began
+    uint8_t phaseHist[14];     // ...counted in steps of 10 ms: before the preamble, 0-9, ..., 120 and later
+    uint32_t strongAtMs;       // millis() at the start of the last scan that hit a strong signal with no preamble
+    uint32_t strongGapMs;      // ...and how long after the scan before it that was
+    uint32_t clearAtMs;        // start of the first empty scan after such a hit
     uint32_t homeRestoreFail;
 };
 
