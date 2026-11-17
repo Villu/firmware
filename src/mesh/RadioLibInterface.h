@@ -583,7 +583,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
                     pc.lora.crcEnabled = hasCRC;
                 }
             }
-        } else if (!received) {
+        } else if (!received && !sideChannelAway) { // away: the lock is held for a whole side frame, so compute
             // Reads the packet type back over SPI, so a chip that lost its config answers WRONG_MODEM. Called after every
             // send by finishSentPacket() and the router, which hold no sequence: unlocked, a readout could land inside it.
             RadioLibTime_t reported;

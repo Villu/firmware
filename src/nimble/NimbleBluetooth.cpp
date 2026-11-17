@@ -494,6 +494,7 @@ class MeshCoreBleLink : public meshcore_host::AppLink, public BLECharacteristicC
     // From the app: the NimBLE task fills it, the main loop empties it
     Frame rx[QUEUE];
     volatile uint8_t rxHead = 0, rxTail = 0;
+    volatile bool rxFlush = false; // a disconnect: the main loop drops what the old session left
     // To the app: main loop only
     Frame tx[QUEUE];
     uint8_t txHead = 0, txTail = 0;
@@ -519,8 +520,9 @@ class MeshCoreBleLink : public meshcore_host::AppLink, public BLECharacteristicC
 
     void onDisconnect()
     {
+        // Runs in the NimBLE task: the tail is the main loop's to move
         appSeen = false;
-        rxTail = rxHead;
+        rxFlush = true;
     }
 
     bool isConnected() override { return appSeen && nimbleBluetooth && nimbleBluetooth->isConnected(); }
@@ -538,6 +540,10 @@ class MeshCoreBleLink : public meshcore_host::AppLink, public BLECharacteristicC
 
     size_t readFrame(uint8_t *dest) override
     {
+        if (rxFlush) {
+            rxFlush = false;
+            rxTail = rxHead;
+        }
         if (rxTail == rxHead)
             return 0;
         const size_t len = rx[rxTail].len;

@@ -351,6 +351,25 @@ bool sendDirectTextByName(const char *name, const char *text)
     return the_mesh->sendMessage(*contact, now, 0, text, expectedAck, estTimeout) != MSG_SEND_FAILED;
 }
 
+bool sendDirectTextWhere(bool (*pick)(const char *name, const uint8_t *pubKey, void *ctx), void *ctx, const char *text)
+{
+    if (!the_mesh || !pick || !text)
+        return false;
+    ContactsIterator it = the_mesh->startContactsIterator();
+    ContactInfo found;
+    while (it.hasNext(the_mesh, found)) {
+        if (!pick(found.name, found.id.pub_key, ctx))
+            continue;
+        ContactInfo *contact = the_mesh->lookupContactByPubKey(found.id.pub_key, PUB_KEY_SIZE);
+        if (!contact)
+            return false;
+        uint32_t expectedAck = 0, estTimeout = 0;
+        const uint32_t now = the_mesh->getRTCClock()->getCurrentTimeUnique();
+        return the_mesh->sendMessage(*contact, now, 0, text, expectedAck, estTimeout) != MSG_SEND_FAILED;
+    }
+    return false;
+}
+
 bool sendAdvert(bool flood)
 {
     if (!the_mesh)

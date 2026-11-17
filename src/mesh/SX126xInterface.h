@@ -197,6 +197,11 @@ class SX126xInterface : public RadioLibInterface
 
 #ifdef SX126X_SIDE_CHANNEL
   public:
+    ~SX126xInterface()
+    {
+        if (SideChannelRadio::instance == this) // the init ladder destroys the drivers whose chip did not answer
+            SideChannelRadio::instance = nullptr;
+    }
     bool sideChannelFits(const SideChannelConfig &cfg) const override;
     bool sideChannelStart(const SideChannelConfig &cfg) override;
     void sideChannelStop() override { sideEnabled = false; }

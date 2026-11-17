@@ -120,6 +120,8 @@ bool sendChannelText(uint8_t channelIdx, const char *text);
 bool sendDirectText(const uint8_t *pubKeyPrefix, size_t prefixLen, const char *text);
 /// Send a text to the contact with this name (or the first whose name starts with it)
 bool sendDirectTextByName(const char *name, const char *text);
+/// Send a text to the first contact pick() says yes to; false if it says yes to none or the text could not be queued
+bool sendDirectTextWhere(bool (*pick)(const char *name, const uint8_t *pubKey, void *ctx), void *ctx, const char *text);
 /// Announce this node: to direct neighbours, or flooded through repeaters
 bool sendAdvert(bool flood);
 bool setNodeName(const char *name);

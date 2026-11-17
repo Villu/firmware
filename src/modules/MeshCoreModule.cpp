@@ -6,12 +6,15 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "PowerStatus.h"
+#include "SPILock.h"
+#include "concurrency/LockGuard.h"
 #include "Router.h"
 #include "RoutingModule.h"
 #include "Throttle.h"
 #include "airtime.h"
 #include "gps/RTC.h"
 #include "main.h"
+#include "meshUtils.h"
 #include "mesh/Channels.h"
 #include "mesh/MeshRadio.h"
 #include "mesh/SideChannel.h"
@@ -31,6 +34,16 @@ static const char *const MC_CHANNEL_NAME = "MeshCore";
 // How often this node announces itself to MeshCore neighbours
 #ifndef MESHCORE_ADVERT_INTERVAL_MS
 #define MESHCORE_ADVERT_INTERVAL_MS (3 * 60 * 60 * 1000UL)
+#endif
+// The MeshCore phone app's TCP port once Wi-Fi is up; 0 for none (it has no pairing: see OpenLinkGuard in the host)
+#ifndef MESHCORE_TCP_PORT
+#define MESHCORE_TCP_PORT 5000
+#endif
+// Written once the "MeshCore" channel has been made: after that, no such channel means the user switched MeshCore off
+static const char *const MC_CHANNEL_MADE_FILE = "/meshcore/channel_made";
+// A new name costs a slot in Meshtastic's node table, and a name on MeshCore's Public channel costs its sender nothing
+#ifndef MESHCORE_NEW_NODES_PER_HOUR
+#define MESHCORE_NEW_NODES_PER_HOUR 12
 #endif
 // Node numbers that stand for MeshCore nodes: this top byte, and a name ending in the tag
 static const uint32_t MC_NODE_PREFIX = 0x4D000000;
@@ -88,14 +101,43 @@ NodeNum nodeNumForName(const char *name)
     return MC_NODE_PREFIX | ((h ^ (h >> 24)) & 0x00FFFFFF);
 }
 
-// The Meshtastic node that stands for a MeshCore node of this name; made or refreshed, and told to the phone
-NodeNum touchNode(const char *name, uint8_t hops)
+bool newNodeAllowed()
+{
+    static uint32_t windowStartMs;
+    static uint8_t made;
+    if (!Throttle::isWithinTimespanMs(windowStartMs, 60 * 60 * 1000UL)) {
+        windowStartMs = millis();
+        made = 0;
+    }
+    if (made >= MESHCORE_NEW_NODES_PER_HOUR)
+        return false;
+    made++;
+    return true;
+}
+
+// The Meshtastic node that stands for a MeshCore node of this name; made or refreshed, and told to the phone.
+// 0 if it would be a new node and this hour's new ones are used up (never with always).
+NodeNum touchNode(const char *name, uint8_t hops, bool always = false)
 {
     const NodeNum num = nodeNumForName(name);
+    if (!always && !nodeDB->getMeshNode(num) && !newNodeAllowed())
+        return 0;
     meshtastic_User user = meshtastic_User_init_zero;
     snprintf(user.id, sizeof(user.id), "!%08x", (unsigned)num);
-    // The node table keeps MC_NODE_NAME_LEN characters of a name: the tag has to be inside them
-    snprintf(user.long_name, sizeof(user.long_name), "%.*s%s", (int)(MC_NODE_NAME_LEN - strlen(MC_NAME_TAG)), name, MC_NAME_TAG);
+    // The node table keeps MC_NODE_NAME_LEN bytes of a name, and the tag has to be inside them. The name comes off the
+    // air: only what a protobuf string may carry, and cut between characters, not inside one.
+    char clean[sizeof(user.long_name)];
+    strncpy(clean, name, sizeof(clean) - 1);
+    clean[sizeof(clean) - 1] = 0;
+    sanitizeUtf8(clean, sizeof(clean));
+    size_t keep = strlen(clean);
+    const size_t room = MC_NODE_NAME_LEN - strlen(MC_NAME_TAG);
+    if (keep > room) {
+        keep = room;
+        while (keep > 0 && ((uint8_t)clean[keep] & 0xC0) == 0x80)
+            keep--;
+    }
+    snprintf(user.long_name, sizeof(user.long_name), "%.*s%s", (int)keep, clean, MC_NAME_TAG);
     size_t n = 0;
     for (const char *c = name; *c && n < 4; c++) // short names are plain ASCII
         if ((uint8_t)*c > 0x20 && (uint8_t)*c < 0x7F)
@@ -155,6 +197,16 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
 {
   public:
     SideChannelRadio *radio = nullptr;
+    bool enabled = true; // false: the radio stays on Meshtastic (see the class comment in MeshCoreModule.h)
+
+    void setEnabled(bool on)
+    {
+        enabled = on;
+        if (!on)
+            radio->sideChannelStop();
+        else if (haveCfg)
+            radioSetParams(lastFreqMHz, lastBwKHz, lastSf, lastCr);
+    }
 
     // ---- Platform: radio ----
     static SideChannelConfig sideConfig(float freqMHz, float bwKHz, uint8_t sf, uint8_t cr)
@@ -178,6 +230,13 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
     void radioSetParams(float freqMHz, float bwKHz, uint8_t sf, uint8_t cr) override
     {
         const SideChannelConfig cfg = sideConfig(freqMHz, bwKHz, sf, cr);
+        lastFreqMHz = freqMHz;
+        lastBwKHz = bwKHz;
+        lastSf = sf;
+        lastCr = cr;
+        haveCfg = true;
+        if (!enabled)
+            return; // kept for when it is switched on
         if (!radioParamsAllowed(freqMHz, bwKHz, sf, cr))
             LOG_ERROR("MeshCore: %.3f MHz SF%u %.1f kHz is outside the region's band or does not fit beside Meshtastic",
                       freqMHz, sf, bwKHz);
@@ -268,7 +327,13 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
                 body = sep + 2;
             }
         }
-        deliverText(touchNode(sender, hops), NODENUM_BROADCAST, (uint8_t)ch, body, snr, hops);
+        NodeNum from = touchNode(sender, hops);
+        if (!from) {
+            // Too many new names this hour: under the one node that stands for the channel, with the name in the text
+            from = touchNode("MeshCore", hops, true);
+            body = text;
+        }
+        deliverText(from, NODENUM_BROADCAST, (uint8_t)ch, body, snr, hops);
     }
     void onChannelMessageSent(uint8_t channelIdx, const char *text) override
     {
@@ -280,13 +345,14 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
     void onDirectMessage(const uint8_t *pubKey, const char *name, const char *text, uint32_t timestamp, float snr) override
     {
         const int ch = mcChannelIndex();
-        deliverText(touchNode(name, 0), nodeDB->getNodeNum(), ch < 0 ? 0 : (uint8_t)ch, text, snr, 0);
+        // From a contact: someone this node exchanged keys with, so always shown
+        deliverText(touchNode(name, 0, true), nodeDB->getNodeNum(), ch < 0 ? 0 : (uint8_t)ch, text, snr, 0);
     }
     void onContact(const uint8_t *pubKey, const char *name, uint8_t type, int32_t latE6, int32_t lonE6, bool isNew,
                    uint8_t hops) override
     {
         const NodeNum num = touchNode(name, hops);
-        if (latE6 == 0 && lonE6 == 0)
+        if (!num || (latE6 == 0 && lonE6 == 0)) // not shown this hour (it is in MeshCore's own contact list), or no position
             return;
         meshtastic_Position pos = meshtastic_Position_init_zero;
         pos.has_latitude_i = pos.has_longitude_i = true;
@@ -313,6 +379,9 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
 
   private:
     uint32_t sendingMs = 0;
+    float lastFreqMHz = 0, lastBwKHz = 0;
+    uint8_t lastSf = 0, lastCr = 0;
+    bool haveCfg = false;
 };
 
 Host host;
@@ -340,13 +409,33 @@ void MeshCoreModule::start()
         failed = true;
         return;
     }
-    ensureMcChannel();
+    {
+        concurrency::LockGuard g(spiLock);
+        channelWasMade = FSCom.exists(MC_CHANNEL_MADE_FILE);
+    }
+    int ch = mcChannelIndex();
+    if (ch < 0 && !channelWasMade)
+        ch = ensureMcChannel();
+    // Made once and gone now: switched off. (Never made for want of a free slot: on, for the MeshCore app alone.)
+    host.enabled = ch >= 0 || !channelWasMade;
     if (!meshcore_host::begin(host, &host, FSCom, "/meshcore")) {
         LOG_ERROR("MeshCore: did not start");
         failed = true;
         return;
     }
-    meshcore_host::startTcpLink(5000);
+    if (ch >= 0 && !channelWasMade) {
+        concurrency::LockGuard g(spiLock);
+        auto f = FSCom.open(MC_CHANNEL_MADE_FILE, FILE_O_WRITE);
+        if (f) {
+            f.print("1");
+            f.close();
+            channelWasMade = true;
+        }
+    }
+    if (!host.enabled)
+        LOG_INFO("MeshCore: off, there is no channel named \"%s\"; add one to switch it on", MC_CHANNEL_NAME);
+    if (MESHCORE_TCP_PORT)
+        meshcore_host::startTcpLink(MESHCORE_TCP_PORT);
     started = true;
     nextAdvertMs = millis() + 30 * 1000;
     nextStatsMs = millis() + 60 * 1000;
@@ -367,6 +456,19 @@ int32_t MeshCoreModule::runOnce()
     meshcore_host::loop();
 
     const uint32_t now = millis();
+    if ((int32_t)(now - nextSwitchMs) >= 0) {
+        nextSwitchMs = now + 2000;
+        const bool want = mcChannelIndex() >= 0 || !channelWasMade;
+        if (want != host.enabled) {
+            host.setEnabled(want);
+            LOG_INFO("MeshCore: switched %s (%s channel named \"%s\")", want ? "on" : "off", want ? "there is a" : "no",
+                     MC_CHANNEL_NAME);
+            if (want)
+                nextAdvertMs = now + 5000;
+        }
+    }
+    if (!host.enabled)
+        nextAdvertMs = now + 5000; // nothing to announce on
     const bool clockKnown = getValidTime(RTCQualityFromNet) != 0;
     if ((int32_t)(now - nextAdvertMs) >= 0) {
         // A node ignores an advert stamped older than the last one it kept from us, and without a clock ours is stamped
@@ -418,13 +520,13 @@ bool MeshCoreModule::handleFromPhone(meshtastic_MeshPacket &p)
 
     bool ok;
     if (toNode) {
-        // The node's name without the tag is the MeshCore contact's name, or the start of a long one
-        const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(p.to);
-        char name[sizeof(node->long_name)];
-        strcpy(name, node->long_name);
-        name[strlen(name) - strlen(MC_NAME_TAG)] = 0;
-        ok = meshcore_host::sendDirectTextByName(name, text);
-        LOG_INFO("MeshCore: direct message to %s %s", name, ok ? "queued" : "not sent (no such contact yet)");
+        // The node's number was made from the MeshCore name in full: the contact whose name gives the same number.
+        // (The node's own long name may be a cut or cleaned-up copy, so it is not what to search by.)
+        NodeNum target = p.to;
+        ok = meshcore_host::sendDirectTextWhere(
+            [](const char *name, const uint8_t *, void *ctx) { return nodeNumForName(name) == *(const NodeNum *)ctx; }, &target,
+            text);
+        LOG_INFO("MeshCore: direct message to !%08x %s", (unsigned)p.to, ok ? "queued" : "not sent (no such contact yet)");
     } else {
         ok = meshcore_host::sendChannelText(0, text);
         LOG_INFO("MeshCore: message to Public %s", ok ? "queued" : "not sent");

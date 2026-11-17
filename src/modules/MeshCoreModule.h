@@ -15,6 +15,9 @@
  * Meshtastic's own interfaces: group messages of MeshCore's Public channel appear in a Meshtastic channel named
  * "MeshCore", senders and advertised nodes as nodes, direct messages as direct messages. Text sent to that channel or
  * to such a node goes out over MeshCore instead of Meshtastic. The MeshCore phone app can connect as well.
+ *
+ * The "MeshCore" channel is also the switch: it is made once, and while there is none (deleted in the Meshtastic app)
+ * the radio stays on Meshtastic all the time. A channel of that name switches MeshCore on again.
  */
 class MeshCoreModule : private concurrency::OSThread
 {
@@ -36,6 +39,8 @@ class MeshCoreModule : private concurrency::OSThread
     uint32_t nextAdvertMs = 0;
     bool advertWithoutClock = false;
     uint32_t nextStatsMs = 0;
+    uint32_t nextSwitchMs = 0;
+    bool channelWasMade = false; // once, on this file system: from then on the channel's absence means "off"
     void start();
 };
 
