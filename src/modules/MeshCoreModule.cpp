@@ -242,6 +242,13 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
         }
         deliverText(touchNode(sender, hops), NODENUM_BROADCAST, (uint8_t)ch, body, snr, hops);
     }
+    void onChannelMessageSent(uint8_t channelIdx, const char *text) override
+    {
+        // Typed in the MeshCore app: show it on the screen and in the Meshtastic app too, as this node's own
+        const int ch = mcChannelIndex();
+        if (channelIdx == 0 && ch >= 0)
+            deliverText(nodeDB->getNodeNum(), NODENUM_BROADCAST, (uint8_t)ch, text, 0, 0);
+    }
     void onDirectMessage(const uint8_t *pubKey, const char *name, const char *text, uint32_t timestamp, float snr) override
     {
         const int ch = mcChannelIndex();
@@ -332,9 +339,21 @@ int32_t MeshCoreModule::runOnce()
     meshcore_host::loop();
 
     const uint32_t now = millis();
+    const bool clockKnown = getValidTime(RTCQualityFromNet) != 0;
     if ((int32_t)(now - nextAdvertMs) >= 0) {
-        nextAdvertMs = now + MESHCORE_ADVERT_INTERVAL_MS;
-        LOG_INFO("MeshCore: advert %s", meshcore_host::sendAdvert(false) ? "queued" : "not sent");
+        // A node ignores an advert stamped older than the last one it kept from us, and without a clock ours is stamped
+        // 2024: wait for the clock (GPS, a phone, NTP) at first, but not for ever.
+        if (!clockKnown && now < 10 * 60 * 1000UL) {
+            nextAdvertMs = now + 5000;
+        } else {
+            nextAdvertMs = now + MESHCORE_ADVERT_INTERVAL_MS;
+            advertWithoutClock = !clockKnown;
+            LOG_INFO("MeshCore: advert %s%s", meshcore_host::sendAdvert(false) ? "queued" : "not sent",
+                     clockKnown ? "" : " (clock not set)");
+        }
+    } else if (advertWithoutClock && clockKnown) {
+        advertWithoutClock = false;
+        nextAdvertMs = now + 5000; // again, now with a time others accept
     }
     if ((int32_t)(now - nextStatsMs) >= 0) {
         nextStatsMs = now + 5 * 60 * 1000;

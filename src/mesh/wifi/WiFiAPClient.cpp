@@ -7,6 +7,7 @@
 #include "mesh/wifi/WiFiAPClient.h"
 
 #include "main.h"
+#include "mesh/MeshService.h"
 #include "mesh/api/WiFiServerAPI.h"
 #include "target_specific.h"
 #include <WiFi.h>
@@ -242,9 +243,14 @@ static void onNetworkConnected()
         }
 #endif
 #if !MESHTASTIC_EXCLUDE_SOCKETAPI
+#if SCREEN_HAS_OWN_QUEUE
+        // The colour UI has its own packet queue here, so a phone app on Wi-Fi does not take the screen's packets
+        initApiServer();
+#else
         if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
             initApiServer();
         }
+#endif
 #endif
         APStartupComplete = true;
     }

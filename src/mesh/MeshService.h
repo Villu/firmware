@@ -148,6 +148,9 @@ class MeshService
 
     /// Show a line of text on the screen only, as a message from this node to itself
     void showOnScreen(const char *text);
+
+    /// A text one client is sending: show it on the other one too (screen <-> phone), as a message from this node
+    void showToOtherClient(const meshtastic_MeshPacket &p, bool fromScreen);
 #endif
 
     /// Allows the bluetooth handler to free packets after they have been sent
@@ -197,7 +200,7 @@ class MeshService
      * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep
      * a reference
      */
-    void handleToRadio(meshtastic_MeshPacket &p);
+    void handleToRadio(meshtastic_MeshPacket &p, bool fromScreen = false);
 
 #if MESHTASTIC_ENABLE_FRAME_INJECTION
     /// Test/debug seam (build-flag gated, off by default): deliver a client-supplied frame into the
@@ -232,6 +235,9 @@ class MeshService
 
     /// Send a packet to the phone
     void sendToPhone(meshtastic_MeshPacket *p);
+
+    /// The last step of sendToPhone: into the phone's queue (takes ownership), within that queue's limits
+    void queueForPhone(meshtastic_MeshPacket *p);
 
     /// Send an MQTT message to the phone for client proxying
     virtual void sendMqttMessageToClientProxy(meshtastic_MqttClientProxyMessage *m);

@@ -14,6 +14,7 @@
 #include "NodeDB.h"
 #include "Power.h"
 #include "PowerFSM.h"
+#include "Throttle.h"
 #include "TypeConversions.h"
 #include "UptimeClock.h"
 #include "gps/GPSLog.h"
@@ -310,7 +311,7 @@ void MeshService::injectAsReceived(meshtastic_MeshPacket &p)
  * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep a
  * reference
  */
-void MeshService::handleToRadio(meshtastic_MeshPacket &p)
+void MeshService::handleToRadio(meshtastic_MeshPacket &p, bool fromScreen)
 {
 #if defined(ARCH_PORTDUINO)
     if (SimRadio::instance && p.decoded.portnum == meshtastic_PortNum_SIMULATOR_APP) {
@@ -339,6 +340,10 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
 
     // Record the time the packet arrived from the phone.
     stampRxTime(&p);
+
+#if SCREEN_HAS_OWN_QUEUE
+    showToOtherClient(p, fromScreen);
+#endif
 
 #if MESHCORE_COEXIST
     // Text for MeshCore's channel or for a MeshCore node goes out over MeshCore, never as Meshtastic
@@ -541,18 +546,40 @@ void MeshService::sendToPhone(meshtastic_MeshPacket *p)
         sendToScreen(forScreen);
 #endif
 
+    queueForPhone(p);
+}
+
+#if SCREEN_HAS_OWN_QUEUE
+// The screen no longer empties the phone's queue, so a node without a phone keeps it full for good: say so once in a
+// while with a count, not once per packet.
+static void notePhoneQueueFull()
+{
+    static uint32_t dropped, lastLogMs;
+    dropped++;
+    if (dropped == 1 || !Throttle::isWithinTimespanMs(lastLogMs, 10 * 60 * 1000UL)) {
+        LOG_INFO("ToPhone queue full (no phone connected?), %u packets dropped or displaced so far", (unsigned)dropped);
+        lastLogMs = millis();
+    }
+}
+#define PHONE_QUEUE_FULL(what) notePhoneQueueFull()
+#else
+#define PHONE_QUEUE_FULL(what) LOG_WARN("ToPhone queue full, " what)
+#endif
+
+void MeshService::queueForPhone(meshtastic_MeshPacket *p)
+{
     if (toPhoneQueue.numFree() == 0) {
         // ROUTING_APP is the phone's only delivery confirmation, so it displaces the oldest like
         // text does. Gate the variant: decoded.portnum aliases encrypted.size in the union.
         if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
             (p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP ||
              p->decoded.portnum == meshtastic_PortNum_RANGE_TEST_APP || p->decoded.portnum == meshtastic_PortNum_ROUTING_APP)) {
-            LOG_WARN("ToPhone queue full, discard oldest");
+            PHONE_QUEUE_FULL("discard oldest");
             meshtastic_MeshPacket *d = toPhoneQueue.dequeuePtr(0);
             if (d)
                 releaseToPool(d);
         } else {
-            LOG_WARN("ToPhone queue full, drop packet");
+            PHONE_QUEUE_FULL("drop packet");
             releaseToPool(p);
             fromNum++; // Make sure to notify observers in case they are reconnected so they can get the packets
             return;
@@ -596,6 +623,25 @@ void MeshService::showOnScreen(const char *text)
     memcpy(p->decoded.payload.bytes, text, len);
     p->decoded.payload.size = len;
     sendToScreen(p);
+}
+
+void MeshService::showToOtherClient(const meshtastic_MeshPacket &p, bool fromScreen)
+{
+    if (p.which_payload_variant != meshtastic_MeshPacket_decoded_tag ||
+        p.decoded.portnum != meshtastic_PortNum_TEXT_MESSAGE_APP || p.decoded.payload.size == 0)
+        return;
+    // The screen files a direct message under its sender, so one of our own would open a chat with ourselves there.
+    // Phone apps file it under the node it is for.
+    if (!fromScreen && p.to != NODENUM_BROADCAST)
+        return;
+    meshtastic_MeshPacket *copy = packetPool.allocCopy(p);
+    if (!copy)
+        return;
+    copy->from = nodeDB->getNodeNum();
+    if (fromScreen)
+        queueForPhone(copy);
+    else
+        sendToScreen(copy);
 }
 #endif
 

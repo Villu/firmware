@@ -109,6 +109,10 @@ public:
       virtual void onTraceRecv(mesh::Packet *pkt, uint32_t tag, uint32_t auth_code, uint8_t flags,
                                const uint8_t *path_snrs, const uint8_t *path_hashes, uint8_t path_len) { }
       virtual void onRawDataRecv(mesh::Packet *pkt) { }
+#ifdef MESHCORE_HOSTED
+      // the app sent a text to a group channel (the host may show it on its own screen)
+      virtual void onChannelMessageSent(uint8_t channel_idx, const char* text) { }
+#endif
       virtual ~Listener() { }
   };
 

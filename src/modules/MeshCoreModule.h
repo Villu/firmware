@@ -34,6 +34,7 @@ class MeshCoreModule : private concurrency::OSThread
     bool started = false;
     bool failed = false;
     uint32_t nextAdvertMs = 0;
+    bool advertWithoutClock = false;
     uint32_t nextStatsMs = 0;
     void start();
 };

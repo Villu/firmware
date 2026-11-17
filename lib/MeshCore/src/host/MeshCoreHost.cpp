@@ -142,6 +142,11 @@ class HostListener : public MyMesh::Listener
                                      the_mesh->getRTCClock()->getCurrentTime(), pkt->getSNR(), hops);
     }
     void onQueueSizeChanged(int msgcount) override { queued_for_app = msgcount; }
+    void onChannelMessageSent(uint8_t channel_idx, const char *text) override
+    {
+        if (events)
+            events->onChannelMessageSent(channel_idx, text);
+    }
     void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t *path) override
     {
         logf("MeshCore: advert from %s (type %u, %u hops)%s", contact.name, contact.type, path_len & 63,

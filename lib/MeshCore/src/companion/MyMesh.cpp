@@ -1191,6 +1191,12 @@ void MyMesh::handleCmdFrame(size_t len) {
       bool success = getChannel(channel_idx, channel);
       if (success && sendGroupMessage(msg_timestamp, channel.channel, _prefs.node_name, text, len - i)) {
         writeOKFrame();
+#ifdef MESHCORE_HOSTED
+        if (_listener) {
+          cmd_frame[len] = 0;  // make the text null terminated
+          _listener->onChannelMessageSent(channel_idx, text);
+        }
+#endif
       } else {
         writeErrFrame(ERR_CODE_NOT_FOUND); // bad channel_idx
       }

@@ -64,6 +64,8 @@ class Events
     /// A group-channel text. text is as sent: "Sender: message".
     virtual void onChannelMessage(uint8_t channelIdx, const char *channelName, const char *text, uint32_t timestamp, float snr,
                                   uint8_t hops) = 0;
+    /// The MeshCore app sent a text to a group channel. text is the message alone.
+    virtual void onChannelMessageSent(uint8_t channelIdx, const char *text) {}
     /// A direct text from a contact
     virtual void onDirectMessage(const uint8_t *pubKey, const char *name, const char *text, uint32_t timestamp, float snr) = 0;
     /// An advert was heard. type: 1 chat, 2 repeater, 3 room server, 4 sensor. lat/lon in 1e-6 degrees, 0 if not shared.
