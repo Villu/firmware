@@ -3954,8 +3954,15 @@ void NodeDB::saveNodeDatabaseIfDirty()
 int NodeDB::onReboot(void *)
 {
     // A graceful reboot has no other save point.
+#if MESHCORE_COEXIST
+    // Always: "last heard" changes without making the database dirty, and without this a restart puts every node
+    // back to when it was last written - a node first heard this session to "never".
+    if (!isStorageLocked())
+        saveNodeDatabaseToDisk();
+#else
     if (nodeDatabaseDirty && !isStorageLocked())
         saveNodeDatabaseToDisk();
+#endif
     return 0;
 }
 

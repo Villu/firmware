@@ -3,6 +3,7 @@
 #if MESHCORE_COEXIST
 
 #include "FSCommon.h"
+#include "GPSStatus.h"
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "PowerStatus.h"
@@ -20,6 +21,7 @@
 #endif
 #include "mesh/Channels.h"
 #include "mesh/MeshRadio.h"
+#include "mesh/RadioLibInterface.h"
 #include "mesh/SideChannel.h"
 #include "mesh/generated/meshtastic/mesh.pb.h"
 #include <MeshCoreHost.h>
@@ -104,6 +106,14 @@ NodeNum nodeNumForName(const char *name)
     return MC_NODE_PREFIX | ((h ^ (h >> 24)) & 0x00FFFFFF);
 }
 
+// How far a MeshCore packet came, in Meshtastic's two fields. Clients take "hops away" as hop_start - hop_limit, and
+// treat a packet as heard first-hand only if the two are equal and not zero: so a direct one is 1 and 1, never 0 and 0.
+void setHops(meshtastic_MeshPacket *p, uint8_t hops)
+{
+    p->hop_limit = 1;
+    p->hop_start = hops + 1;
+}
+
 bool newNodeAllowed()
 {
     static uint32_t windowStartMs;
@@ -119,8 +129,9 @@ bool newNodeAllowed()
 }
 
 // The Meshtastic node that stands for a MeshCore node of this name; made or refreshed, and told to the phone.
-// 0 if it would be a new node and this hour's new ones are used up (never with always).
-NodeNum touchNode(const char *name, uint8_t hops, bool always = false)
+// 0 if it would be a new node and this hour's new ones are used up (never with always). tell: pass it on to the screen
+// and the phone even if nothing about the node changed (an advert: it was heard, which moves it up their lists).
+NodeNum touchNode(const char *name, uint8_t hops, bool always = false, bool tell = false)
 {
     const NodeNum num = nodeNumForName(name);
     if (!always && !nodeDB->getMeshNode(num) && !newNodeAllowed())
@@ -157,7 +168,7 @@ NodeNum touchNode(const char *name, uint8_t hops, bool always = false)
         node->has_hops_away = true;
         node->hops_away = hops;
     }
-    if (changed) {
+    if (changed || tell) {
         if (meshtastic_MeshPacket *p = packetPool.allocZeroed()) {
             p->from = num;
             p->to = NODENUM_BROADCAST;
@@ -168,7 +179,7 @@ NodeNum touchNode(const char *name, uint8_t hops, bool always = false)
             p->decoded.payload.size =
                 pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_User_msg, &user);
             p->rx_time = getValidTime(RTCQualityFromNet);
-            p->hop_start = hops;
+            setHops(p, hops);
             service->sendToPhone(p);
         }
     }
@@ -191,7 +202,7 @@ void deliverText(NodeNum from, NodeNum to, uint8_t channel, const char *text, fl
     p->decoded.payload.size = len;
     p->rx_time = getValidTime(RTCQualityFromNet);
     p->rx_snr = snr;
-    p->hop_start = hops;
+    setHops(p, hops);
     p->transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
 #if !MESHTASTIC_EXCLUDE_EXTERNALNOTIFICATION
     // The sound, light or buzzer a Meshtastic text gets: that module only sees what the router hands it
@@ -206,6 +217,8 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
   public:
     SideChannelRadio *radio = nullptr;
     bool enabled = true; // false: the radio stays on Meshtastic (see the class comment in MeshCoreModule.h)
+    float freqMHz() const { return lastFreqMHz; }
+    float bwKHz() const { return lastBwKHz; }
 
     void setEnabled(bool on)
     {
@@ -359,7 +372,7 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
     void onContact(const uint8_t *pubKey, const char *name, uint8_t type, int32_t latE6, int32_t lonE6, bool isNew,
                    uint8_t hops) override
     {
-        const NodeNum num = touchNode(name, hops);
+        const NodeNum num = touchNode(name, hops, false, true);
         if (!num || (latE6 == 0 && lonE6 == 0)) // not shown this hour (it is in MeshCore's own contact list), or no position
             return;
         meshtastic_Position pos = meshtastic_Position_init_zero;
@@ -380,7 +393,7 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
             p->decoded.payload.size =
                 pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_Position_msg, &pos);
             p->rx_time = pos.time;
-            p->hop_start = hops;
+            setHops(p, hops);
             service->sendToPhone(p);
         }
     }
@@ -395,6 +408,62 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
 Host host;
 
 } // namespace
+
+// For the screen software (patches/device-ui-meshcore.patch has a weak reference to this): whether MeshCore is
+// running, Meshtastic's real frequency, and a line about MeshCore for the home screen. Called from the screen's task.
+extern "C" bool meshcoreUiStatus(float *homeFreqMHz, char *mcLine, size_t len)
+{
+    if (homeFreqMHz)
+        *homeFreqMHz = RadioLibInterface::instance ? RadioLibInterface::instance->getFreq() : 0;
+    const bool running = host.enabled && host.radio && host.radio->sideChannelRunning();
+    if (mcLine && len) {
+        if (running)
+            snprintf(mcLine, len, "MC %.3f  %gk", host.freqMHz(), host.bwKHz());
+        else
+            snprintf(mcLine, len, "MC off");
+    }
+    return running;
+}
+
+// For the screen: MeshCore's counters as text. 0: two short lines for the home screen; 1: the statistics page;
+// 2: a line for the About page.
+extern "C" void meshcoreUiCounters(char *text, size_t len, int kind)
+{
+    if (!text || !len)
+        return;
+    text[0] = 0;
+    if (!host.radio)
+        return;
+    SideChannelStats s;
+    host.radio->sideChannelGetStats(s);
+    meshcore_host::Status st;
+    meshcore_host::getStatus(st);
+    if (kind == 0)
+        snprintf(text, len, "MC rx %u tx %u\n%d contacts%s", (unsigned)s.frames, (unsigned)s.txOk, st.contacts,
+                 st.appConnected ? ", app on" : "");
+    else if (kind == 1)
+        snprintf(text, len,
+                 "MeshCore: received %u, bad %u, sent %u, failed %u\n"
+                 "scans %u, hits %u, no preamble %u, no header %u\n"
+                 "a look takes %u.%u ms (longest %u.%u), %u put off\n"
+                 "%d contacts, app %s, %d waiting for it",
+                 (unsigned)s.frames, (unsigned)s.crcErrors, (unsigned)s.txOk, (unsigned)s.txFail, (unsigned)s.looks,
+                 (unsigned)s.cadHits, (unsigned)s.noPreamble, (unsigned)s.noHeader, (unsigned)(s.lookUsLast / 1000),
+                 (unsigned)(s.lookUsLast % 1000 / 100), (unsigned)(s.lookUsMax / 1000), (unsigned)(s.lookUsMax % 1000 / 100),
+                 (unsigned)s.homeBusy, st.contacts, st.appConnected ? "connected" : "not connected", st.queuedForApp);
+    else
+        snprintf(text, len, "MeshCore \"%s\", key %02X%02X%02X%02X, app port %d", st.nodeName, st.pubKey[0], st.pubKey[1],
+                 st.pubKey[2], st.pubKey[3], MESHCORE_TCP_PORT);
+}
+
+// Also for the screen: the satellites the GPS receiver sees now (the screen otherwise only learns them from this
+// node's position reports, which need a fix); true when there is a fix.
+extern "C" bool firmwareGpsStatus(uint32_t *satellites)
+{
+    if (satellites)
+        *satellites = gpsStatus ? gpsStatus->getNumSatellites() : 0;
+    return gpsStatus && gpsStatus->getHasLock();
+}
 
 MeshCoreModule::MeshCoreModule() : concurrency::OSThread("MeshCore") {}
 

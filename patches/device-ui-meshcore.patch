@@ -1,0 +1,1327 @@
+diff --git a/include/graphics/view/TFT/TFTView_320x240.h b/include/graphics/view/TFT/TFTView_320x240.h
+--- a/include/graphics/view/TFT/TFTView_320x240.h
++++ b/include/graphics/view/TFT/TFTView_320x240.h
+@@ -161,7 +161,8 @@
+     // add own message to current chat
+     virtual void addMessage(lv_obj_t *container, uint32_t msgTime, uint32_t requestId, char *msg, LogMessage::MsgStatus status);
+     // add new message to container
+-    virtual void newMessage(uint32_t nodeNum, lv_obj_t *container, uint8_t channel, const char *msg);
++    virtual void newMessage(uint32_t nodeNum, lv_obj_t *container, uint8_t channel, const char *msg,
++                            const char *meta = nullptr);
+     // create empty message container for node or group channel
+     virtual lv_obj_t *newMessageContainer(uint32_t from, uint32_t to, uint8_t ch);
+     // filter or highlight node
+@@ -275,6 +276,8 @@
+     void setBellText(bool banner, bool sound);
+     void setChannelName(const meshtastic_Channel &ch);
+     uint32_t timestamp(char *buf, uint32_t time, bool update);
++    void updateTopStatus(void);
++    void updateHomeExtras(void);
+     void updateLocationMap(uint32_t objects);
+     void attribution(std::string url);
+ 
+@@ -300,6 +303,7 @@
+     static void ui_event_SettingsButton(lv_event_t *e);
+ 
+     static void ui_event_NodeButton(lv_event_t *e);
++    static void ui_event_NodeMessageButton(lv_event_t *e);
+     static void ui_event_ChannelButton(lv_event_t *e);
+     static void ui_event_ChatButton(lv_event_t *e);
+     static void ui_event_ChatDelButton(lv_event_t *e);
+diff --git a/source/graphics/common/ViewController.cpp b/source/graphics/common/ViewController.cpp
+--- a/source/graphics/common/ViewController.cpp
++++ b/source/graphics/common/ViewController.cpp
+@@ -717,6 +717,10 @@
+                     view->addOrUpdateNode(node.num, node.channel, node.last_heard, MeshtasticView::eRole::unknown, false,
+                                           node.via_mqtt);
+                 }
++                // what the radio already knows: without it a node has no hop count until its next packet, and the
++                // "hops away" filter hides it until then
++                if (node.has_hops_away && node.num != myNodeNum)
++                    view->updateHopsAway(node.num, node.hops_away);
+                 if (node.has_position) {
+                     view->updatePosition(node.num, node.position.latitude_i, node.position.longitude_i, node.position.altitude, 0,
+                                          node.position.precision_bits);
+diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTView_320x240.cpp
+--- a/source/graphics/TFT/TFTView_320x240.cpp
++++ b/source/graphics/TFT/TFTView_320x240.cpp
+@@ -83,6 +83,89 @@
+ #define CR_REPLACEMENT 0x0C              // dummy to record several lines in a one line textarea
+ #define THIS TFTView_320x240::instance() // need to use this in all static methods
+ 
++// From firmware that runs MeshCore beside Meshtastic on the one radio (its MeshCoreModule.cpp); absent in any other.
++// True while MeshCore is running; fills in Meshtastic's real frequency and a line about MeshCore for the home screen.
++extern "C" bool meshcoreUiStatus(float *homeFreqMHz, char *mcLine, size_t len) __attribute__((weak));
++
++// Likewise from the firmware: satellites the GPS receiver sees now; true when it has a fix
++extern "C" bool firmwareGpsStatus(uint32_t *satellites) __attribute__((weak));
++
++// MeshCore's counters as text: 0 two short lines (home screen), 1 the statistics page, 2 a line for About
++extern "C" void meshcoreUiCounters(char *text, size_t len, int kind) __attribute__((weak));
++
++static uint32_t ownSats = 0; // satellites in the last position this device reported
++static lv_obj_t *homeMcLabel = nullptr;  // MeshCore's cell on the home screen
++static lv_obj_t *statsMcLabel = nullptr; // MeshCore's block under the statistics table
++static lv_obj_t *aboutDeviceLabel = nullptr;
++static uint32_t lastRxNode = 0; // whose packet the home screen's signal line is about
++
++// A question with Yes and Cancel over everything else. A long press on a home row switches a radio off or reboots:
++// with a trackball that is one resting thumb away, so those ask first.
++static lv_obj_t *confirmBox = nullptr;
++static void (*confirmedAction)(void) = nullptr;
++
++static void confirmBoxEvent(lv_event_t *e)
++{
++    const bool yes = (bool)(unsigned long)lv_event_get_user_data(e);
++    void (*action)(void) = confirmedAction;
++    confirmedAction = nullptr;
++    if (confirmBox) {
++        lv_obj_delete_async(confirmBox);
++        confirmBox = nullptr;
++    }
++    if (yes && action)
++        action();
++}
++
++static void confirmAction(const char *question, void (*action)(void))
++{
++    if (confirmBox)
++        return;
++    confirmedAction = action;
++    confirmBox = lv_obj_create(lv_layer_top()); // covers the screen, so nothing under it can be pressed
++    lv_obj_set_size(confirmBox, LV_PCT(100), LV_PCT(100));
++    lv_obj_remove_flag(confirmBox, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_set_style_bg_color(confirmBox, lv_color_hex(0x000000), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_bg_opa(confirmBox, 150, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_border_width(confirmBox, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_radius(confirmBox, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++
++    lv_obj_t *box = lv_obj_create(confirmBox);
++    lv_obj_set_size(box, 250, 120);
++    lv_obj_center(box);
++    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_set_style_bg_color(box, lv_color_hex(0x303030), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_bg_opa(box, 255, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_border_color(box, lv_color_hex(0x67ea94), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_border_width(box, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_radius(box, 8, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_all(box, 8, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++
++    lv_obj_t *text = lv_label_create(box);
++    lv_obj_set_width(text, LV_PCT(100));
++    lv_label_set_long_mode(text, LV_LABEL_LONG_WRAP);
++    lv_label_set_text(text, question);
++    lv_obj_set_align(text, LV_ALIGN_TOP_MID);
++    lv_obj_set_style_text_font(text, &ui_font_montserrat_14, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_text_color(text, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_text_align(text, LV_TEXT_ALIGN_CENTER, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++
++    for (int i = 0; i < 2; i++) {
++        lv_obj_t *button = lv_btn_create(box);
++        lv_obj_set_size(button, 96, 30);
++        lv_obj_set_align(button, i ? LV_ALIGN_BOTTOM_RIGHT : LV_ALIGN_BOTTOM_LEFT);
++        lv_obj_set_style_bg_color(button, lv_color_hex(i ? 0x606060 : 0xc03030), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_radius(button, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_shadow_width(button, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_t *label = lv_label_create(button);
++        lv_label_set_text(label, i ? _("Cancel") : "Yes");
++        lv_obj_center(label);
++        lv_obj_set_style_text_font(label, &ui_font_montserrat_14, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(label, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_add_event_cb(button, confirmBoxEvent, LV_EVENT_CLICKED, (void *)(unsigned long)(i == 0));
++    }
++}
++
+ #define LV_COLOR_HEX(C) {.blue = (C >> 0) & 0xff, .green = (C >> 8) & 0xff, .red = (C >> 16) & 0xff}
+ 
+ #define VALID_TIME(T) (T > 1000000 && T < UINT32_MAX)
+@@ -111,8 +194,235 @@
+     node_pos1_idx,
+     node_pos2_idx,
+     node_tm1_idx,
+-    node_tm2_idx
++    node_tm2_idx,
++    node_tag_idx, // which network / "this device"
++    node_msg_idx, // the Message button of the opened row
++    node_id_idx   // node number and role, in the opened row
+ };
++
++// A small coloured word beside a node's short name
++static lv_obj_t *makeNodeTag(lv_obj_t *panel, const char *text, lv_color_t color)
++{
++    lv_obj_t *tag = lv_label_create(panel);
++    lv_obj_set_pos(tag, 172, 18);
++    lv_obj_set_size(tag, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
++    lv_obj_set_style_align(tag, LV_ALIGN_TOP_LEFT, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_label_set_text(tag, text);
++    lv_obj_set_style_text_font(tag, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_text_color(tag, lv_color_hex(0x000000), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_bg_color(tag, color, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_bg_opa(tag, 255, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_radius(tag, 4, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_hor(tag, 4, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_ver(tag, 1, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    return tag;
++}
++
++// MeshCore nodes carry " [MC]" at the end of their name (the firmware's MeshCoreModule): show the tag for those
++static void setNetworkTag(lv_obj_t *panel, const char *longName)
++{
++    if (panel == objects.node_panel || lv_obj_get_child_count(panel) <= node_tag_idx)
++        return;
++    const size_t len = strlen(longName);
++    if (len >= 5 && strcmp(longName + len - 5, " [MC]") == 0)
++        lv_obj_remove_flag(panel->LV_OBJ_IDX(node_tag_idx), LV_OBJ_FLAG_HIDDEN);
++    else
++        lv_obj_add_flag(panel->LV_OBJ_IDX(node_tag_idx), LV_OBJ_FLAG_HIDDEN);
++}
++
++// A node's row. Closed, two lines beside the picture: short name (and distance), how it is reached, when it was last
++// heard; under that the long name, the network tag, the battery. Opened: position and telemetry, then Message.
++static const int32_t nodeRowClosed = 36, nodeRowOpen = 116;
++
++static void compactNodeRow(lv_obj_t *p)
++{
++    if (lv_obj_get_child_count(p) <= node_tm2_idx)
++        return;
++    lv_obj_t **c = p->spec_attr->children;
++    lv_obj_set_height(p, nodeRowClosed);
++    lv_obj_set_style_min_height(c[node_btn_idx], nodeRowClosed - 4, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_pos(c[node_img_idx], -5, 1);
++    lv_obj_set_pos(c[node_lbs_idx], 31, 0);
++    // top line, right: signal or hops, then last heard
++    lv_obj_set_style_align(c[node_sig_idx], LV_ALIGN_TOP_RIGHT, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_pos(c[node_sig_idx], -40, 3);
++    lv_obj_set_style_text_font(c[node_sig_idx], &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_pos(c[node_lh_idx], 8, 1);
++    // second line: long name, (tag), battery
++    lv_obj_set_pos(c[node_lbl_idx], 31, 18);
++    lv_obj_set_size(c[node_lbl_idx], 136, 15);
++    lv_label_set_long_mode(c[node_lbl_idx], LV_LABEL_LONG_DOT);
++    lv_obj_set_pos(c[node_bat_idx], 8, 19);
++    lv_obj_set_style_text_font(c[node_bat_idx], &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    // only in the opened row
++    lv_obj_set_pos(c[node_pos1_idx], -5, 50);
++    lv_obj_set_pos(c[node_pos2_idx], -5, 64);
++    lv_obj_set_pos(c[node_tm1_idx], 8, 38);
++    lv_obj_set_pos(c[node_tm2_idx], 8, 52);
++}
++
++// The line under a chat's name in the chat list: when, who, and the start of the last message. Newest chat on top.
++static void setChatPreview(lv_obj_t *chatButton, const char *when, const char *who, const char *text)
++{
++    if (!chatButton || lv_obj_get_child_count(chatButton) < 3)
++        return;
++    char line[80];
++    lv_snprintf(line, sizeof(line), "%s%s%s%s%s", when ? when : "", when && when[0] ? "  " : "", who ? who : "",
++                who && who[0] ? ": " : "", text ? text : "");
++    for (char *at = line; *at; at++)
++        if (*at == '\n' || *at == '\r')
++            *at = ' ';
++    lv_label_set_text(lv_obj_get_child(chatButton, 2), line);
++    lv_obj_move_to_index(chatButton, 0);
++}
++
++// The home screen's pictures are button backgrounds, which cannot be drawn smaller. Each button gets a small copy of
++// its picture as a child and hides its own; a timer keeps picture and colour of the copy in step with the button.
++static void syncHomeIcons(lv_timer_t *)
++{
++    if (!objects.home_container)
++        return;
++    for (uint32_t i = 0; i < lv_obj_get_child_count(objects.home_container); i++) {
++        lv_obj_t *button = lv_obj_get_child(objects.home_container, i);
++        if (!lv_obj_check_type(button, &lv_button_class) || lv_obj_get_child_count(button) == 0)
++            continue;
++        lv_obj_t *icon = lv_obj_get_child(button, lv_obj_get_child_count(button) - 1);
++        if (!lv_obj_check_type(icon, &lv_image_class))
++            continue;
++        const void *src = lv_obj_get_style_bg_image_src(button, LV_PART_MAIN);
++        if (src && lv_image_get_src(icon) != src)
++            lv_image_set_src(icon, src);
++        lv_obj_set_style_image_recolor(icon, lv_obj_get_style_bg_image_recolor(button, LV_PART_MAIN), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_image_recolor_opa(icon, lv_obj_get_style_bg_image_recolor_opa(button, LV_PART_MAIN), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    }
++}
++
++static void compactHome(void)
++{
++    lv_obj_t *box = objects.home_container;
++    if (!box || !objects.home_panel)
++        return;
++    lv_obj_set_style_pad_top(objects.home_panel, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_bottom(objects.home_panel, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_left(objects.home_panel, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_right(objects.home_panel, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_width(box, LV_PCT(100)); // two cells of picture and text have to fit side by side
++    lv_obj_set_style_pad_row(box, 3, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_column(box, 4, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_left(box, 4, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_top(box, 3, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_border_width(box, 1, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_shadow_width(box, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++
++    // MeshCore's own cell, after the radio's
++    if (meshcoreUiCounters && objects.home_lora_label) {
++        lv_obj_t *button = lv_button_create(box);
++        add_style_home_button_style(button);
++        lv_obj_set_style_shadow_width(button, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_t *name = lv_label_create(button);
++        lv_label_set_text(name, "MC");
++        lv_obj_center(name);
++        lv_obj_set_style_text_font(name, &ui_font_montserrat_12, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(name, lv_color_hex(0xff8c04), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        homeMcLabel = lv_label_create(box);
++        lv_label_set_text(homeMcLabel, "MC");
++        lv_obj_move_to_index(button, lv_obj_get_index(objects.home_lora_label) + 1);
++        lv_obj_move_to_index(homeMcLabel, lv_obj_get_index(button) + 1);
++    }
++
++    for (uint32_t i = 0; i < lv_obj_get_child_count(box); i++) {
++        lv_obj_t *child = lv_obj_get_child(box, i);
++        if (lv_obj_check_type(child, &lv_button_class)) {
++            lv_obj_set_size(child, 24, 24);
++            lv_obj_set_ext_click_area(child, 3);
++            if (lv_obj_get_style_bg_image_src(child, LV_PART_MAIN)) {
++                lv_obj_set_style_bg_image_opa(child, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++                lv_obj_set_style_bg_image_opa(child, 0, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_PRESSED);
++                lv_obj_t *icon = lv_image_create(child);
++                lv_image_set_scale(icon, 160); // 36 px pictures at about 22
++                lv_obj_center(icon);
++                lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
++            }
++        } else if (lv_obj_check_type(child, &lv_label_class)) {
++            lv_obj_set_width(child, 104);
++            lv_label_set_long_mode(child, LV_LABEL_LONG_CLIP);
++            lv_obj_set_style_text_font(child, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            lv_obj_set_style_text_line_space(child, -1, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        }
++    }
++    syncHomeIcons(nullptr);
++    lv_timer_create(syncHomeIcons, 500, nullptr);
++
++    // the statistics page has room under its table: MeshCore's counters go there
++    if (meshcoreUiCounters && objects.tools_statistics_panel) {
++        statsMcLabel = lv_label_create(objects.tools_statistics_panel);
++        lv_obj_set_width(statsMcLabel, LV_PCT(98));
++        lv_label_set_long_mode(statsMcLabel, LV_LABEL_LONG_WRAP);
++        lv_label_set_text(statsMcLabel, "");
++        // the table takes the whole page: this lies over its empty lower rows
++        lv_obj_add_flag(statsMcLabel, LV_OBJ_FLAG_IGNORE_LAYOUT);
++        lv_obj_set_align(statsMcLabel, LV_ALIGN_BOTTOM_LEFT);
++        lv_obj_set_style_bg_color(statsMcLabel, lv_color_hex(0x303030), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_opa(statsMcLabel, 255, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_pad_all(statsMcLabel, 3, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(statsMcLabel, lv_color_hex(0xe0e0e0), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_font(statsMcLabel, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    }
++    // chats list and chats: less air
++    if (objects.chats_panel) {
++        lv_obj_set_style_pad_row(objects.chats_panel, 3, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_pad_top(objects.chats_panel, 4, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    }
++}
++
++// A frequency slot's frequency. The formula here is off for the narrow EU plan; the firmware knows the frequency of the
++// slot in use, so within the same region and preset the others are counted from that.
++static float slotFrequency(const meshtastic_Config_LoRaConfig &cfg, meshtastic_Config_LoRaConfig_ModemPreset preset,
++                           uint32_t channel)
++{
++    float frequency = LoRaPresets::getRadioFreq(cfg.region, preset, channel);
++    if (meshcoreUiStatus && cfg.use_preset && preset == cfg.modem_preset) {
++        float real = 0;
++        meshcoreUiStatus(&real, nullptr, 0);
++        if (real > 0)
++            frequency += real - LoRaPresets::getRadioFreq(cfg.region, cfg.modem_preset, cfg.channel_num);
++    }
++    return frequency;
++}
++
++// The word after the time of a message we sent
++static const char *sentStatusWord(LogMessage::MsgStatus status, bool toChannel)
++{
++    switch (status) {
++    case LogMessage::eNone:
++        return "sending";
++    case LogMessage::eHeard:
++        return "sent";
++    case LogMessage::eAcked:
++        return toChannel ? "sent" : "delivered";
++    case LogMessage::eNoResponse:
++        return "no reply";
++    case LogMessage::eFailed:
++        return "failed";
++    default:
++        return "";
++    }
++}
++
++// The small line above a message bubble: who and when, and for our own messages what became of them
++static lv_obj_t *makeMessageMeta(lv_obj_t *row, lv_obj_t *bubble, const char *text, bool right)
++{
++    lv_obj_t *meta = lv_label_create(row);
++    lv_obj_set_size(meta, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
++    lv_obj_set_align(meta, right ? LV_ALIGN_TOP_RIGHT : LV_ALIGN_TOP_LEFT);
++    lv_obj_set_pos(meta, right ? -4 : 4, 0);
++    lv_label_set_text(meta, text);
++    lv_obj_set_style_text_font(meta, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_text_color(meta, lv_color_hex(0xa0a0a0), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_align(bubble, right ? LV_ALIGN_TOP_RIGHT : LV_ALIGN_TOP_LEFT);
++    lv_obj_set_y(bubble, 12);
++    return meta;
++}
+ 
+ enum ScrollDirection {
+     scrollDownLeft = 1,
+@@ -304,8 +614,23 @@
+     lv_textarea_set_text(objects.nodes_hl_name_area, highlight.node_name);
+ 
+     // initialize own node panel
+-    if (ownNode && objects.node_panel)
++    if (ownNode && objects.node_panel) {
+         nodes[ownNode] = objects.node_panel;
++        if (lv_obj_get_child_count(objects.node_panel) == node_tag_idx)
++            makeNodeTag(objects.node_panel, "you", colorMesh);
++        compactNodeRow(objects.node_panel);
++    }
++    compactHome();
++    // the Wi-Fi password is not for everyone who sees the screen
++    lv_textarea_set_password_mode(objects.settings_wifi_password_textarea, true);
++    // dialogs: nothing of the list behind them is to show through
++    if (objects.main_screen)
++        for (uint32_t i = 0; i < lv_obj_get_child_count(objects.main_screen); i++) {
++            lv_obj_t *child = lv_obj_get_child(objects.main_screen, i);
++            const lv_opa_t opa = lv_obj_get_style_bg_opa(child, LV_PART_MAIN);
++            if (opa >= 240 && opa < 255)
++                lv_obj_set_style_bg_opa(child, 255, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        }
+ 
+     // touch screen calibration data
+     uint16_t *parameters = (uint16_t *)db.uiConfig.calibration_data.bytes;
+@@ -730,6 +1055,10 @@
+         lv_label_set_text(obj, label);
+     };
+ 
++    aboutDeviceLabel = lv_label_create(objects.settings_about_panel);
++    lv_obj_set_size(aboutDeviceLabel, LV_PCT(100), LV_SIZE_CONTENT);
++    lv_obj_set_style_text_align(aboutDeviceLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
++    lv_label_set_text(aboutDeviceLabel, "");
+     char fw[128];
+     snprintf(fw, sizeof(fw), ABOUT_FIRMWARE_TEXT, firmware_version);
+     createLabel(objects.settings_about_panel, fw);
+@@ -1123,7 +1452,11 @@
+ void TFTView_320x240::ui_event_NodeButton(lv_event_t *e)
+ {
+     static bool animRunning = false;
+-    static auto deleted_cb = [](_lv_anim_t *) { animRunning = false; };
++    static auto deleted_cb = [](_lv_anim_t *) {
++        animRunning = false;
++        if (currentPanel) // the opened row, with its Message button, may reach below the screen
++            lv_obj_scroll_to_view(currentPanel, LV_ANIM_ON);
++    };
+     lv_event_code_t event_code = lv_event_get_code(e);
+     if (event_code == LV_EVENT_CLICKED && !animRunning) {
+         uint32_t nodeNum = (unsigned long)e->user_data;
+@@ -1137,7 +1470,7 @@
+             int32_t height = lv_obj_get_height(currentPanel);
+             lv_anim_init(&a);
+             lv_anim_set_var(&a, currentPanel);
+-            lv_anim_set_values(&a, height, 136 - height);
++            lv_anim_set_values(&a, height, height > 60 ? nodeRowClosed : nodeRowOpen);
+             lv_anim_set_duration(&a, 200);
+             lv_anim_set_exec_cb(&a, ui_anim_node_panel_cb);
+             lv_anim_set_path_cb(&a, lv_anim_path_linear);
+@@ -1151,7 +1484,7 @@
+             int32_t height = lv_obj_get_height(panel);
+             lv_anim_init(&a);
+             lv_anim_set_var(&a, panel);
+-            lv_anim_set_values(&a, height, 136 - height);
++            lv_anim_set_values(&a, height, height > 60 ? nodeRowClosed : nodeRowOpen);
+             lv_anim_set_duration(&a, 200);
+             lv_anim_set_exec_cb(&a, ui_anim_node_panel_cb);
+             lv_anim_set_path_cb(&a, lv_anim_path_linear);
+@@ -1177,10 +1510,16 @@
+     } else if (event_code == LV_EVENT_LONG_PRESSED) {
+         //  set color and text of clicked node
+         uint32_t nodeNum = (unsigned long)e->user_data;
+-        bool isMessagable = !((unsigned long)(THIS->nodes[nodeNum]->LV_OBJ_IDX(node_img_idx)->user_data) == eRole::unmessagable);
+-        if (nodeNum != THIS->ownNode && isMessagable)
++        if (nodeNum && nodeNum != THIS->ownNode)
+             THIS->showMessages(nodeNum);
+     }
++}
++
++void TFTView_320x240::ui_event_NodeMessageButton(lv_event_t *e)
++{
++    uint32_t nodeNum = (unsigned long)lv_event_get_user_data(e);
++    if (nodeNum && nodeNum != THIS->ownNode && THIS->nodes.find(nodeNum) != THIS->nodes.end())
++        THIS->showMessages(nodeNum);
+ }
+ 
+ void TFTView_320x240::ui_event_GroupsButton(lv_event_t *e)
+@@ -1454,10 +1793,14 @@
+     lv_event_code_t event_code = lv_event_get_code(e);
+     if (event_code == LV_EVENT_LONG_PRESSED && THIS->db.config.has_lora) {
+         // toggle lora tx on/off
+-        meshtastic_Config_LoRaConfig &lora = THIS->db.config.lora;
+-        lora.tx_enabled = !lora.tx_enabled;
+-        THIS->controller->sendConfig(meshtastic_Config_LoRaConfig{lora});
+-        THIS->showLoRaFrequency(lora);
++        confirmAction(THIS->db.config.lora.tx_enabled ? "Switch LoRa transmit OFF?\n(both networks go silent)"
++                                                      : "Switch LoRa transmit on?",
++                      [](void) {
++                          meshtastic_Config_LoRaConfig &lora = THIS->db.config.lora;
++                          lora.tx_enabled = !lora.tx_enabled;
++                          THIS->controller->sendConfig(meshtastic_Config_LoRaConfig{lora});
++                          THIS->showLoRaFrequency(lora);
++                      });
+     }
+ }
+ 
+@@ -1537,19 +1880,24 @@
+         // Themes::recolorButton(objects.home_location_button, toggle);
+     } else if (event_code == LV_EVENT_LONG_PRESSED && THIS->configComplete) {
+         // toggle GPS not_present <-> enabled
+-        uint32_t toggle = (unsigned long)objects.home_location_button->user_data;
+-        objects.home_location_button->user_data = (void *)(1 - toggle);
+-
+-        meshtastic_Config_PositionConfig &position = THIS->db.config.position;
+-        if (position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT)
+-            position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_ENABLED;
+-        else {
+-            position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT;
+-        }
+-        Themes::recolorButton(objects.home_location_button,
+-                              position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED);
+-        THIS->controller->sendConfig(meshtastic_Config_PositionConfig{position});
+-        THIS->notifyReboot(true);
++        confirmAction(THIS->db.config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED
++                          ? "Switch GPS off and reboot?"
++                          : "Switch GPS on and reboot?",
++                      [](void) {
++                          uint32_t toggle = (unsigned long)objects.home_location_button->user_data;
++                          objects.home_location_button->user_data = (void *)(1 - toggle);
++
++                          meshtastic_Config_PositionConfig &position = THIS->db.config.position;
++                          if (position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT)
++                              position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_ENABLED;
++                          else {
++                              position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT;
++                          }
++                          Themes::recolorButton(objects.home_location_button,
++                                                position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED);
++                          THIS->controller->sendConfig(meshtastic_Config_PositionConfig{position});
++                          THIS->notifyReboot(true);
++                      });
+     }
+ }
+ 
+@@ -1570,13 +1918,16 @@
+             THIS->activeSettings = eWifi;
+         } else {
+             // toggle WLAN on/off
+-            uint32_t toggle = (unsigned long)objects.home_wlan_button->user_data;
+-            objects.home_wlan_button->user_data = (void *)(1 - toggle);
+-            meshtastic_Config_NetworkConfig &network = THIS->db.config.network;
+-            network.wifi_enabled = !network.wifi_enabled;
+-            Themes::recolorButton(objects.home_wlan_button, network.wifi_enabled);
+-            THIS->controller->sendConfig(meshtastic_Config_NetworkConfig{network});
+-            THIS->notifyReboot(true);
++            confirmAction(THIS->db.config.network.wifi_enabled ? "Switch Wi-Fi OFF and reboot?" : "Switch Wi-Fi on and reboot?",
++                          [](void) {
++                              uint32_t toggle = (unsigned long)objects.home_wlan_button->user_data;
++                              objects.home_wlan_button->user_data = (void *)(1 - toggle);
++                              meshtastic_Config_NetworkConfig &network = THIS->db.config.network;
++                              network.wifi_enabled = !network.wifi_enabled;
++                              Themes::recolorButton(objects.home_wlan_button, network.wifi_enabled);
++                              THIS->controller->sendConfig(meshtastic_Config_NetworkConfig{network});
++                              THIS->notifyReboot(true);
++                          });
+         }
+     }
+ }
+@@ -1586,14 +1937,17 @@
+     lv_event_code_t event_code = lv_event_get_code(e);
+     if (event_code == LV_EVENT_LONG_PRESSED && THIS->configComplete) {
+         // toggle MQTT on/off
+-        uint32_t toggle = (unsigned long)objects.home_mqtt_button->user_data;
+-        objects.home_mqtt_button->user_data = (void *)(1 - toggle);
+-
+-        meshtastic_ModuleConfig_MQTTConfig &mqtt = THIS->db.module_config.mqtt;
+-        mqtt.enabled = !mqtt.enabled;
+-        Themes::recolorButton(objects.home_mqtt_button, mqtt.enabled);
+-        THIS->controller->sendConfig(meshtastic_ModuleConfig_MQTTConfig{mqtt});
+-        THIS->notifyReboot(true);
++        confirmAction(THIS->db.module_config.mqtt.enabled ? "Switch MQTT off and reboot?" : "Switch MQTT ON and reboot?",
++                      [](void) {
++                          uint32_t toggle = (unsigned long)objects.home_mqtt_button->user_data;
++                          objects.home_mqtt_button->user_data = (void *)(1 - toggle);
++
++                          meshtastic_ModuleConfig_MQTTConfig &mqtt = THIS->db.module_config.mqtt;
++                          mqtt.enabled = !mqtt.enabled;
++                          Themes::recolorButton(objects.home_mqtt_button, mqtt.enabled);
++                          THIS->controller->sendConfig(meshtastic_ModuleConfig_MQTTConfig{mqtt});
++                          THIS->notifyReboot(true);
++                      });
+     }
+ }
+ 
+@@ -1610,12 +1964,12 @@
+     } else if (event_code == LV_EVENT_LONG_PRESSED) {
+         if (THIS->formatSD) {
+             ignoreClicked = true;
+-            THIS->formatSDCard();
++            confirmAction("FORMAT the SD card?\nEverything on it is erased.", [](void) { THIS->formatSDCard(); });
+         } else if (THIS->cardDetected) {
+             // release a healthy card so it can be pulled without corrupting
+             // it; a tap mounts it again
+             ignoreClicked = true;
+-            THIS->ejectSDCard();
++            confirmAction("Eject the SD card?\n(maps stop until it is mounted again)", [](void) { THIS->ejectSDCard(); });
+         }
+     }
+ }
+@@ -1863,9 +2217,8 @@
+         lv_dropdown_set_selected(objects.settings_modem_preset_dropdown, THIS->preset2val(THIS->db.config.lora.modem_preset));
+ 
+         char buf[60];
+-        sprintf(buf, _("FrequencySlot: %d (%g MHz)"), THIS->db.config.lora.channel_num,
+-                LoRaPresets::getRadioFreq(THIS->db.config.lora.region, THIS->db.config.lora.modem_preset,
+-                                          THIS->db.config.lora.channel_num));
++        sprintf(buf, "Frequency slot %d (%.3f MHz)", (int)THIS->db.config.lora.channel_num,
++                slotFrequency(THIS->db.config.lora, THIS->db.config.lora.modem_preset, THIS->db.config.lora.channel_num));
+         lv_label_set_text(objects.frequency_slot_label, buf);
+ 
+         uint32_t numChannels = LoRaPresets::getNumChannels(THIS->db.config.lora.region, THIS->db.config.lora.modem_preset);
+@@ -2138,6 +2491,16 @@
+ {
+     lv_event_code_t event_code = lv_event_get_code(e);
+     if (event_code == LV_EVENT_CLICKED && THIS->activeSettings == eNone) {
++        if (aboutDeviceLabel) {
++            char text[240], mc[96] = "";
++            if (meshcoreUiCounters)
++                meshcoreUiCounters(mc, sizeof(mc), 2);
++            const uint32_t ip = THIS->db.connectionStatus.wifi.status.ip_address;
++            lv_snprintf(text, sizeof(text), "%s (%s), node !%08x\nIP %d.%d.%d.%d, Meshtastic app port 4403\n%s\n", THIS->db.long_name,
++                        THIS->db.short_name, (unsigned)THIS->ownNode, (int)(ip & 0xff), (int)((ip >> 8) & 0xff),
++                        (int)((ip >> 16) & 0xff), (int)((ip >> 24) & 0xff), mc);
++            lv_label_set_text(aboutDeviceLabel, text);
++        }
+         THIS->ui_set_active(objects.settings_button, objects.settings_about_panel, objects.top_about_panel);
+     }
+ }
+@@ -3047,7 +3410,7 @@
+ 
+ void TFTView_320x240::updateLocationMap(uint32_t num)
+ {
+-    lv_label_set_text_fmt(objects.top_map_label, _("Locations Map (%d/%d)"), num, nodeCount);
++    lv_label_set_text_fmt(objects.top_map_label, "Map: %d of %d nodes", (int)num, (int)nodeCount);
+ }
+ 
+ /**
+@@ -3396,6 +3759,7 @@
+     lv_event_code_t event_code = lv_event_get_code(e);
+     if (event_code == LV_EVENT_CLICKED) {
+         THIS->ui_set_active(objects.settings_button, objects.tools_statistics_panel, objects.top_statistics_panel);
++        THIS->updateHomeExtras(); // MeshCore's counters, at once
+     } else if (event_code == LV_EVENT_LONG_PRESSED) {
+         // clear statistics table
+         THIS->updateStatistics(meshtastic_MeshPacket{.from = 0});
+@@ -3774,13 +4138,30 @@
+     time(&lastHeard);
+ 
+     if (rssi != 0 || snr != 0.0) {
+-        char buf[40];
+-        sprintf(buf, "SNR: %.1f\nRSSI: %" PRId32, snr, rssi);
++        // what was heard last: how well, from whom, when
++        char buf[64];
++        char who[8] = "";
++        auto heard = nodes.find(lastRxNode);
++        if (heard != nodes.end() && heard->second)
++            lv_snprintf(who, sizeof(who), "%s", lv_label_get_text(heard->second->LV_OBJ_IDX(node_lbs_idx)));
++        char when[8] = "";
++        time_t now;
++        time(&now);
++        if (VALID_TIME(now)) {
++            std::tm now_tm{};
++            localtime_r(&now, &now_tm);
++            strftime(when, sizeof(when), "%R", &now_tm);
++        }
++        if (rssi)
++            lv_snprintf(buf, sizeof(buf), "SNR %.1f  RSSI %d\n%s %s", snr, (int)rssi, who, when);
++        else
++            lv_snprintf(buf, sizeof(buf), "SNR %.1f  RSSI -\n%s %s", snr, who, when);
+         lv_label_set_text(objects.home_signal_label, buf);
+ 
+         uint32_t pct = signalStrength2Percent(rssi, snr);
+-        sprintf(buf, "(%d%%)", pct);
+-        lv_label_set_text(objects.home_signal_pct_label, buf);
++        lv_label_set_text(objects.home_signal_pct_label, ""); // it sat on top of the text: the figure goes into the line
++        lv_snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "  %d%%", (int)pct);
++        lv_label_set_text(objects.home_signal_label, buf);
+         if (pct > 80) {
+             lv_obj_set_style_bg_image_src(objects.home_signal_button, &img_home_signal_button_image,
+                                           ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+@@ -4863,10 +5244,9 @@
+     lv_obj_t *slider = lv_event_get_target_obj(e);
+     char buf[40];
+     uint32_t channel = (uint32_t)lv_slider_get_value(slider);
+-    sprintf(buf, _("FrequencySlot: %d (%g MHz)"), channel,
+-            LoRaPresets::getRadioFreq(THIS->db.config.lora.region,
+-                                      THIS->val2preset(lv_dropdown_get_selected(objects.settings_modem_preset_dropdown)),
+-                                      channel));
++    sprintf(buf, "Frequency slot %d (%.3f MHz)", (int)channel,
++            slotFrequency(THIS->db.config.lora,
++                          THIS->val2preset(lv_dropdown_get_selected(objects.settings_modem_preset_dropdown)), channel));
+     lv_label_set_text(objects.frequency_slot_label, buf);
+ }
+ 
+@@ -4889,8 +5269,7 @@
+     lv_slider_set_value(objects.frequency_slot_slider, channel, LV_ANIM_ON);
+ 
+     char buf[40];
+-    sprintf(buf, _("FrequencySlot: %d (%g MHz)"), channel,
+-            LoRaPresets::getRadioFreq(THIS->db.config.lora.region, preset, channel));
++    sprintf(buf, "Frequency slot %d (%.3f MHz)", (int)channel, slotFrequency(THIS->db.config.lora, preset, channel));
+     lv_label_set_text(objects.frequency_slot_label, buf);
+ }
+ 
+@@ -4964,8 +5343,19 @@
+         if (msg[i] == CR_REPLACEMENT)
+             msg[i] = '\n';
+ 
+-    controller->sendTextMessage(to, ch, hopLimit, actTime, requestId, usePkc, msg);
+-    addMessage(activeMsgContainer, actTime, requestId, msg, LogMessage::eNone);
++    time_t sentAt;
++    time(&sentAt); // actTime is only the last time the firmware passed on: it can be many minutes old
++    if (!VALID_TIME(sentAt))
++        sentAt = actTime;
++    controller->sendTextMessage(to, ch, hopLimit, sentAt, requestId, usePkc, msg);
++    addMessage(activeMsgContainer, sentAt, requestId, msg, LogMessage::eNone);
++    {
++        char when[20];
++        timestamp(when, sentAt, false);
++        auto chat = chats.find(channelOrNode);
++        if (chat != chats.end())
++            setChatPreview(chat->second, when, "you", msg);
++    }
+ }
+ 
+ /**
+@@ -4989,22 +5379,27 @@
+     lv_obj_set_style_pad_bottom(hiddenPanel, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+     hiddenPanel->user_data = (void *)requestId;
+ 
+-    // add timestamp
+-    char buf[284]; // 237 + 4 + 40 + 2 + 1
+-    buf[0] = '\0';
+-    uint32_t len = timestamp(buf, msgTime, status == LogMessage::eNone);
+-    strcat(&buf[len], msg);
++    // time, date and what became of it: a small line of its own (the second child, see handleTextMessageResponse)
++    char meta[48];
++    uint32_t len = timestamp(meta, msgTime, status == LogMessage::eNone);
++    const char *word = sentStatusWord(status, (unsigned long)container->user_data < c_max_channels);
++    lv_snprintf(meta + len, sizeof(meta) - len, "%s%s", len && word[0] ? "  " : "", word);
+ 
+     lv_obj_t *textLabel = lv_label_create(hiddenPanel);
+     // calculate expected size of text bubble, to make it look nicer
+-    lv_coord_t width = lv_txt_get_width(buf, strlen(buf), &ui_font_montserrat_12, 0);
++    lv_coord_t width = lv_txt_get_width(msg, strlen(msg), &ui_font_montserrat_14, 0);
+     lv_obj_set_width(textLabel, std::max<int32_t>(std::min<int32_t>(width, 200) + 10, 40));
+     lv_obj_set_height(textLabel, LV_SIZE_CONTENT);
+     lv_obj_set_y(textLabel, 0);
+     lv_obj_set_align(textLabel, LV_ALIGN_RIGHT_MID);
+-    lv_label_set_text(textLabel, buf);
++    lv_label_set_text(textLabel, msg);
+ 
+     add_style_chat_message_style(textLabel);
++    lv_obj_t *metaLabel = makeMessageMeta(hiddenPanel, textLabel, meta, true);
++    if (status == LogMessage::eFailed)
++        lv_obj_set_style_text_color(metaLabel, colorRed, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    else if (status == LogMessage::eAcked && (unsigned long)container->user_data >= c_max_channels)
++        lv_obj_set_style_text_color(metaLabel, colorMesh, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+ 
+     lv_obj_scroll_to_view(hiddenPanel, LV_ANIM_ON);
+     lv_obj_move_foreground(objects.message_input_area);
+@@ -5170,7 +5565,7 @@
+             nodesOnline++;
+         }
+     } else {
+-        lv_label_set_text(ui_lastHeardLabel, "");
++        lv_label_set_text(ui_lastHeardLabel, "never");
+     }
+ 
+     lv_obj_set_style_text_align(ui_lastHeardLabel, LV_TEXT_ALIGN_RIGHT,
+@@ -5225,6 +5620,28 @@
+     lv_obj_set_style_text_align(ui_Telemetry2Label, LV_TEXT_ALIGN_RIGHT,
+                                 ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+ 
++    // network tag, and the Message button: below the fold, so it shows only in the opened row
++    makeNodeTag(p, "MeshCore", colorOrange);
++    lv_obj_t *msgButton = lv_btn_create(p);
++    lv_obj_set_size(msgButton, 150, 28);
++    lv_obj_set_align(msgButton, LV_ALIGN_TOP_MID);
++    lv_obj_set_pos(msgButton, 0, 82);
++    lv_obj_set_style_bg_color(msgButton, colorMesh, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_radius(msgButton, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_shadow_width(msgButton, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_t *msgButtonLabel = lv_label_create(msgButton);
++    lv_label_set_text(msgButtonLabel, _("Message"));
++    lv_obj_center(msgButtonLabel);
++    lv_obj_set_style_text_color(msgButtonLabel, lv_color_hex(0x000000), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_add_event_cb(msgButton, ui_event_NodeMessageButton, LV_EVENT_CLICKED, (void *)nodeNum);
++    lv_obj_t *idLabel = lv_label_create(p);
++    lv_obj_set_pos(idLabel, -5, 38);
++    lv_obj_set_size(idLabel, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
++    lv_obj_set_style_align(idLabel, LV_ALIGN_TOP_LEFT, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_text_font(idLabel, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_label_set_text_fmt(idLabel, "!%08x  %s", (unsigned)nodeNum, deviceRoleToString(role));
++    setNetworkTag(p, userLong);
++
+     // optimisation: hide all 6ix extended labels by default; enable only when set
+     // lv_obj_add_flag(ui_lastHeardLabel, LV_OBJ_FLAG_HIDDEN); // lastHeard
+     lv_obj_add_flag(ui_BatteryLabel, LV_OBJ_FLAG_HIDDEN); // Autohide battery
+@@ -5235,6 +5652,8 @@
+     lv_obj_add_flag(ui_Telemetry2Label, LV_OBJ_FLAG_HIDDEN);
+ 
+     lv_obj_add_event_cb(nodeButton, ui_event_NodeButton, LV_EVENT_ALL, (void *)nodeNum);
++
++    compactNodeRow(p);
+ 
+     // move node into new position within nodePanel
+     if (lastHeard) {
+@@ -5322,6 +5741,10 @@
+         }
+         lv_label_set_text(it->second->LV_OBJ_IDX(node_lbl_idx), cfg.long_name);
+         it->second->LV_OBJ_IDX(node_lbl_idx)->user_data = (void *)nodeNum;
++        setNetworkTag(it->second, cfg.long_name);
++        if (lv_obj_get_child_count(it->second) > node_id_idx)
++            lv_label_set_text_fmt(it->second->LV_OBJ_IDX(node_id_idx), "!%08x  %s", (unsigned)nodeNum,
++                                  deviceRoleToString((MeshtasticView::eRole)cfg.role));
+         lv_label_set_text(it->second->LV_OBJ_IDX(node_lbs_idx), cfg.short_name);
+         char *userData = (char *)&(it->second->LV_OBJ_IDX(node_lbs_idx)->user_data);
+         userData[0] = cfg.short_name[0];
+@@ -5365,6 +5788,10 @@
+ 
+ void TFTView_320x240::updatePosition(uint32_t nodeNum, int32_t lat, int32_t lon, int32_t alt, uint32_t sats, uint32_t precision)
+ {
++    if (nodeNum == ownNode && sats != ownSats) {
++        ownSats = sats;
++        updateTopStatus();
++    }
+     int32_t altU = abs(alt) < 10000 ? alt : 0;
+     char units[3] = {};
+     if (db.config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_METRIC) {
+@@ -5390,12 +5817,19 @@
+         lonSeconds %= 60;
+         char lonLetter = (lon > 0) ? 'E' : 'W';
+ 
+-        if (sats)
+-            sprintf(buf, "%c%02i° %2i'%02i\"   %u sats\n%c%02i° %2i'%02i\"   %d%s", latLetter, abs(latDegrees), latMinutes,
+-                    latSeconds, sats, lonLetter, abs(lonDegrees), lonMinutes, lonSeconds, altU, units);
+-        else
+-            sprintf(buf, "%c%02i° %2i'%02i\"\n%c%02i° %2i'%02i\"   %d%s", latLetter, abs(latDegrees), latMinutes, latSeconds,
+-                    lonLetter, abs(lonDegrees), lonMinutes, lonSeconds, altU, units);
++        if (lat == 0 && lon == 0) {
++            uint32_t seen = sats;
++            if (firmwareGpsStatus)
++                firmwareGpsStatus(&seen);
++            sprintf(buf, "GPS: no fix\n%u satellites", (unsigned)seen);
++        } else {
++            // decimal degrees: they fit the cell, and are what gets typed into a map
++            uint32_t seen = sats;
++            if (firmwareGpsStatus)
++                firmwareGpsStatus(&seen);
++            sprintf(buf, "%.4f%c %.4f%c\n%d%s  %u sats", fabs(lat * 1e-7), latLetter, fabs(lon * 1e-7), lonLetter, (int)altU, units,
++                    (unsigned)seen);
++        }
+ 
+         lv_label_set_text(objects.home_location_label, buf);
+ 
+@@ -5477,7 +5911,7 @@
+     // we used the userShort label to add the distance, so re-arrange a bit the position
+     lv_obj_t *userShort = nodes[nodeNum]->LV_OBJ_IDX(node_lbs_idx);
+     lv_label_set_text(userShort, buf);
+-    lv_obj_set_pos(userShort, 30, -1);
++    lv_obj_set_pos(userShort, 31, 0);
+ }
+ 
+ /**
+@@ -5627,9 +6061,11 @@
+         if (it != nodes.end()) {
+             char buf[32];
+             if (rssi == 0 && snr == 0.0) {
+-                buf[0] = '\0';
++                strcpy(buf, "direct");
++            } else if (rssi == 0) { // a MeshCore frame, or one handed on without a level
++                sprintf(buf, "direct  snr %.1f", snr);
+             } else {
+-                sprintf(buf, "rssi: %d snr: %.1f", rssi, snr);
++                sprintf(buf, "snr %.1f  rssi %d", snr, rssi);
+             }
+             lv_label_set_text(it->second->LV_OBJ_IDX(node_sig_idx), buf);
+             it->second->LV_OBJ_IDX(node_sig_idx)->user_data = 0;
+@@ -5644,7 +6080,10 @@
+         auto it = nodes.find(nodeNum);
+         if (it != nodes.end()) {
+             char buf[32];
+-            sprintf(buf, _("hops: %d"), (int)hopsAway);
++            if (hopsAway)
++                sprintf(buf, _("hops: %d"), (int)hopsAway);
++            else
++                strcpy(buf, "direct");
+             lv_label_set_text(it->second->LV_OBJ_IDX(node_sig_idx), buf);
+             it->second->LV_OBJ_IDX(node_sig_idx)->user_data = (void *)(unsigned long)hopsAway;
+             lv_obj_remove_flag(it->second->LV_OBJ_IDX(node_sig_idx), LV_OBJ_FLAG_HIDDEN);
+@@ -5753,6 +6192,96 @@
+         lv_obj_add_flag(objects.home_ethernet_label, LV_OBJ_FLAG_HIDDEN);
+         lv_obj_add_flag(objects.home_ethernet_button, LV_OBJ_FLAG_HIDDEN);
+     }
++    updateTopStatus();
++}
++
++/**
++ * What nothing else refreshes: MeshCore's counters (home cell and statistics page), and the location cell while there
++ * is no position yet.
++ */
++void TFTView_320x240::updateHomeExtras(void)
++{
++    char text[320];
++    if (meshcoreUiCounters && homeMcLabel) {
++        meshcoreUiCounters(text, sizeof(text), 0);
++        lv_label_set_text(homeMcLabel, text);
++    }
++    if (meshcoreUiCounters && statsMcLabel && activePanel == objects.tools_statistics_panel) {
++        meshcoreUiCounters(text, sizeof(text), 1);
++        lv_label_set_text(statsMcLabel, text);
++    }
++    if (!hasPosition && firmwareGpsStatus) {
++        uint32_t seen = 0;
++        const bool fix = firmwareGpsStatus(&seen);
++        if (db.config.position.gps_mode != meshtastic_Config_PositionConfig_GpsMode_ENABLED && !seen)
++            lv_snprintf(text, sizeof(text), "GPS off");
++        else
++            lv_snprintf(text, sizeof(text), "GPS: %s\n%u satellites", fix ? "fix" : "no fix", (unsigned)seen);
++        lv_label_set_text(objects.home_location_label, text);
++    }
++}
++
++/**
++ * The small indicators left of the battery, on every screen. Top row: satellites in view and GPS, Wi-Fi, Bluetooth.
++ * Bottom row: MeshCore, MQTT, SD card. White (MeshCore orange, a connected phone blue) when up, dim when switched on
++ * but not connected or without a fix, absent when switched off.
++ */
++void TFTView_320x240::updateTopStatus(void)
++{
++    static lv_obj_t *label = nullptr;
++    if (!label) {
++        if (!objects.battery_panel)
++            return;
++        label = lv_label_create(lv_obj_get_parent(objects.battery_panel));
++        lv_label_set_recolor(label, true);
++        lv_obj_set_size(label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
++        lv_obj_remove_flag(label, LV_OBJ_FLAG_CLICKABLE);
++        lv_obj_set_style_text_font(label, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(label, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_line_space(label, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_move_foreground(label); // once: lists and dialogs opened later go above it
++    }
++#define TOP_ON "#ffffff "
++#define TOP_DIM "#86a3a5 "
++    char buf[200];
++    int n = 0;
++    const meshtastic_DeviceConnectionStatus &status = db.connectionStatus;
++
++    uint32_t sats = ownSats;
++    bool fix = ownSats > 0;
++    if (firmwareGpsStatus)
++        fix = firmwareGpsStatus(&sats);
++    if (sats || db.config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED)
++        n += lv_snprintf(buf + n, sizeof(buf) - n, "%s%u " LV_SYMBOL_GPS "# ", fix ? TOP_ON : TOP_DIM, (unsigned)sats);
++    if (db.config.network.wifi_enabled) {
++        const bool up = status.has_wifi && status.wifi.has_status && status.wifi.status.is_connected;
++        n += lv_snprintf(buf + n, sizeof(buf) - n, "%s" LV_SYMBOL_WIFI "# ", up ? TOP_ON : TOP_DIM);
++    }
++    if (db.config.bluetooth.enabled) {
++        const bool up = status.has_bluetooth && status.bluetooth.is_connected;
++        n += lv_snprintf(buf + n, sizeof(buf) - n, "%s" LV_SYMBOL_BLUETOOTH "#", up ? "#7fc4ff " : TOP_DIM);
++    }
++    n += lv_snprintf(buf + n, sizeof(buf) - n, "\n");
++    if (unreadMessages)
++        n += lv_snprintf(buf + n, sizeof(buf) - n, "#ff8c04 %u " LV_SYMBOL_ENVELOPE "# ", (unsigned)unreadMessages);
++    if (meshcoreUiStatus)
++        n += lv_snprintf(buf + n, sizeof(buf) - n, "%sMC# ", meshcoreUiStatus(nullptr, nullptr, 0) ? "#ff8c04 " : TOP_DIM);
++    if (db.module_config.mqtt.enabled) {
++        const bool up = status.has_wifi && status.wifi.has_status && status.wifi.status.is_mqtt_connected;
++        n += lv_snprintf(buf + n, sizeof(buf) - n, "%s" LV_SYMBOL_UPLOAD "# ", up ? TOP_ON : TOP_DIM);
++    }
++    if (cardDetected)
++        n += lv_snprintf(buf + n, sizeof(buf) - n, TOP_ON LV_SYMBOL_SD_CARD "#");
++#undef TOP_ON
++#undef TOP_DIM
++    lv_label_set_text(label, buf);
++
++    // right of it: the battery symbol, and the charge in percent when there is one
++    const char *percent = lv_label_get_text(objects.battery_percentage_label);
++    const int32_t percentWidth =
++        percent && percent[0] > ' ' ? lv_text_get_width(percent, strlen(percent), &ui_font_montserrat_12, 0) + 4 : 0;
++    lv_obj_align(label, LV_ALIGN_TOP_RIGHT, -(27 + percentWidth), 1);
+ }
+ 
+ // ResponseHandler callbacks
+@@ -6273,6 +6802,25 @@
+                                           : ack ? colorBlueGreen
+                                                 : colorYellow,
+                                           ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            // and say it in words: the small line reads "<date time>  <status>"
++            if (lv_obj_get_child_count(panel) > 1) {
++                lv_obj_t *metaLabel = panel->spec_attr->children[1];
++                char meta[48];
++                lv_snprintf(meta, sizeof(meta), "%s", lv_label_get_text(metaLabel));
++                char *sep = strstr(meta, "  ");
++                char *at = sep ? sep + 2 : (meta[0] >= '0' && meta[0] <= '9') ? meta + strlen(meta) : meta;
++                if (!sep && at != meta && sizeof(meta) - (at - meta) > 3) {
++                    strcpy(at, "  ");
++                    at += 2;
++                }
++                lv_snprintf(at, sizeof(meta) - (at - meta), "%s",
++                            sentStatusWord(err ? LogMessage::eFailed : ack ? LogMessage::eAcked : LogMessage::eHeard,
++                                           channelOrNode < c_max_channels));
++                lv_label_set_text(metaLabel, meta);
++                lv_obj_set_style_text_color(metaLabel,
++                                            err ? colorRed : ack && channelOrNode >= c_max_channels ? colorMesh : lv_color_hex(0xa0a0a0),
++                                            ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            }
+ 
+             // store message
+             break;
+@@ -6295,6 +6843,7 @@
+         writePacketLog(p);
+     }
+     if (p.from != ownNode) {
++        lastRxNode = p.from;
+         updateSignalStrength(p.rx_rssi, p.rx_snr);
+     }
+     updateStatistics(p);
+@@ -6408,6 +6957,7 @@
+     if (ch.role != meshtastic_Channel_Role_DISABLED) {
+         setChannelName(ch);
+ 
++        lv_obj_remove_flag(btn[ch.index], LV_OBJ_FLAG_HIDDEN);
+         lv_obj_set_width(btn[ch.index], lv_pct(80));
+         lv_obj_set_style_pad_left(btn[ch.index], 8, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+ 
+@@ -6458,6 +7008,7 @@
+         lv_snprintf(buf, sizeof(buf), "%d", ch.index);
+         lv_label_set_text(channel[ch.index], buf);
+         lv_obj_set_width(btn[ch.index], lv_pct(30));
++        lv_obj_add_flag(btn[ch.index], LV_OBJ_FLAG_HIDDEN); // an unset channel is made in Settings, not here
+ 
+         if (lv_obj_get_child_cnt(btn[ch.index]) == 2) {
+             lv_obj_delete(lv_obj_get_child(btn[ch.index], 1));
+@@ -6585,7 +7136,15 @@
+         strcpy(loraFreq, _("region unset"));
+     } else if (cfg.use_preset) {
+         float frequency = LoRaPresets::getRadioFreq(cfg.region, cfg.modem_preset, cfg.channel_num) + cfg.frequency_offset;
+-        sprintf(loraFreq, "LoRa %g MHz\n[%s kHz]", frequency, LoRaPresets::getBandwidthString(cfg.modem_preset));
++        if (meshcoreUiStatus) {
++            // two networks on the one radio: a line each, with the frequency the radio really uses
++            char mcLine[24] = "";
++            float real = 0;
++            meshcoreUiStatus(&real, mcLine, sizeof(mcLine));
++            sprintf(loraFreq, "MT %.3f  %sk\n%s", real > 0 ? real : frequency, LoRaPresets::getBandwidthString(cfg.modem_preset),
++                    mcLine);
++        } else
++            sprintf(loraFreq, "LoRa %g MHz\n[%s kHz]", frequency, LoRaPresets::getBandwidthString(cfg.modem_preset));
+         lv_obj_remove_state(objects.basic_settings_modem_preset_button, LV_STATE_DISABLED);
+     } else {
+         float frequency = cfg.override_frequency + cfg.frequency_offset;
+@@ -6821,23 +7380,27 @@
+ uint32_t TFTView_320x240::timestamp(char *buf, uint32_t datetime, bool update)
+ {
+     time_t local = datetime;
++    time_t now;
++    time(&now); // the system clock; actTime is only the last time the firmware happened to pass on
+     if (update) {
+-#ifdef ARCH_PORTDUINO
+-        time(&local);
+-#else
+-        if (VALID_TIME(actTime))
++        if (VALID_TIME(now))
++            local = now;
++        else if (VALID_TIME(actTime))
+             local = actTime;
+-#endif
+     }
+     if (VALID_TIME(local)) {
+-        std::tm date_tm{};
++        std::tm date_tm{}, now_tm{};
+         localtime_r(&local, &date_tm);
+-        if (!update)
+-            return strftime(buf, 20, "%y/%m/%d %R\n", &date_tm);
+-        else
+-            return strftime(buf, 20, "%R\n", &date_tm);
+-    } else
++        localtime_r(&now, &now_tm);
++        // no line break: it goes on the small line above the bubble. Today: the time; this year: day and month too
++        const char *format = "%d.%m.%y %R";
++        if (VALID_TIME(now) && date_tm.tm_year == now_tm.tm_year)
++            format = date_tm.tm_yday == now_tm.tm_yday ? "%R" : "%d.%m. %R";
++        return strftime(buf, 20, format, &date_tm);
++    } else {
++        buf[0] = '\0';
+         return 0;
++    }
+ }
+ 
+ /**
+@@ -6991,9 +7554,9 @@
+     lv_obj_set_scroll_dir(container, LV_DIR_VER);
+     lv_obj_set_style_pad_left(container, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+     lv_obj_set_style_pad_right(container, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+-    lv_obj_set_style_pad_top(container, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_top(container, 3, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+     lv_obj_set_style_pad_bottom(container, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+-    lv_obj_set_style_pad_row(container, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_row(container, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+     lv_obj_set_style_pad_column(container, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+ 
+     // store new message container
+@@ -7023,8 +7586,14 @@
+ void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const char *msg, uint32_t &msgTime, bool restore)
+ {
+     ILOG_DEBUG("newMessage: from:0x%08x, to:0x%08x, ch:%d, time:%d", from, to, ch, msgTime);
++    if (from == ownNode && to == ownNode) {
++        // a notice from the firmware itself (the Bluetooth pairing code): show it, do not open a chat with ourselves
++        if (!restore)
++            messageAlert(msg, true);
++        return;
++    }
+     int pos = 0;
+-    char buf[284]; // 237 + 4 + 40 + 2 + 1
++    char buf[80]; // the small line above the bubble: short name, date and time, how it was heard
+     lv_obj_t *container = nullptr;
+     if (to == UINT32_MAX) { // message for group, prepend short name to msg
+         if (nodes.find(from) == nodes.end()) {
+@@ -7038,6 +7607,7 @@
+             }
+         }
+         buf[pos++] = ' ';
++        buf[pos++] = ' ';
+         container = channelGroup[ch];
+     } else { // message for us
+         container = messages[from];
+@@ -7049,10 +7619,25 @@
+     }
+ 
+     pos += timestamp(&buf[pos], msgTime, !restore);
+-    sprintf(&buf[pos], "%s", msg);
++    buf[pos] = '\0';
++    if (!restore && nodes.find(from) != nodes.end() && from != ownNode) {
++        // the packet's hop count or signal was put on the node's row just before this
++        const char *heard = lv_label_get_text(nodes[from]->LV_OBJ_IDX(node_sig_idx));
++        if (heard && heard[0])
++            lv_snprintf(&buf[pos], sizeof(buf) - pos, "  %s", heard);
++    }
+ 
+     // place message into container
+-    newMessage(from, container, ch, buf);
++    newMessage(from, container, ch, msg, buf);
++    {
++        char when[20], who[8] = "";
++        timestamp(when, msgTime, !restore);
++        if (to == UINT32_MAX && nodes.find(from) != nodes.end())
++            lv_snprintf(who, sizeof(who), "%s", lv_label_get_text(nodes[from]->LV_OBJ_IDX(node_lbs_idx)));
++        auto chat = chats.find(to == UINT32_MAX ? (uint32_t)ch : from);
++        if (chat != chats.end())
++            setChatPreview(chat->second, when, who, msg);
++    }
+ 
+     if (!restore) {
+         // display msg popup if not already viewing the messages
+@@ -7081,7 +7666,7 @@
+  * @param ch
+  * @param msg
+  */
+-void TFTView_320x240::newMessage(uint32_t nodeNum, lv_obj_t *container, uint8_t ch, const char *msg)
++void TFTView_320x240::newMessage(uint32_t nodeNum, lv_obj_t *container, uint8_t ch, const char *msg, const char *meta)
+ {
+     lv_obj_t *hiddenPanel = lv_obj_create(container);
+     lv_obj_set_width(hiddenPanel, lv_pct(100));
+@@ -7105,6 +7690,8 @@
+     add_style_new_message_style(msgLabel);
+     lv_obj_add_flag(msgLabel, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+     lv_obj_add_event_cb(msgLabel, ui_event_chatNodeButton, LV_EVENT_CLICKED, (void *)nodeNum);
++    if (meta && meta[0])
++        makeMessageMeta(hiddenPanel, msgLabel, meta, false);
+ 
+     if (state == MeshtasticView::eRunning) {
+         lv_obj_scroll_to_view(hiddenPanel, LV_ANIM_ON);
+@@ -7120,6 +7707,9 @@
+     //((uint8_t *)msg.bytes)[msg._size] = 0;
+     // ILOG_DEBUG("restoring msg from:0x%08x, to:0x%08x, ch:%d, time:%d, status:%d, trash:%d, size:%d, '%s'", msg.from, msg.to,
+     //           msg.ch, msg.time, (int)msg.status, msg.trashFlag, msg._size, msg.bytes);
++
++    if (msg.from == ownNode && msg.to == ownNode)
++        return; // a notice the firmware once showed, not a chat
+ 
+     if (msg.from == ownNode) {
+         lv_obj_t *container = nullptr;
+@@ -7149,6 +7739,11 @@
+             if (container != activeMsgContainer)
+                 lv_obj_add_flag(container, LV_OBJ_FLAG_HIDDEN);
+             addMessage(container, msg.time, 0, (char *)msg.bytes, msg.status);
++            char when[20];
++            timestamp(when, msg.time, false);
++            auto chat = chats.find(msg.to == UINT32_MAX ? (uint32_t)msg.ch : msg.to);
++            if (chat != chats.end())
++                setChatPreview(chat->second, when, "you", (const char *)msg.bytes);
+         }
+     } else if (nodes.find(msg.from) != nodes.end()) {
+         if (msg.trashFlag && chats.find(msg.from) != chats.end()) {
+@@ -7161,22 +7756,25 @@
+         }
+     } else {
+         int pos = 0;
+-        char buf[284]; // 237 + 4 + 40 + 2 + 1
++        char buf[48];
++        char text[240];
+         if (msg.to != UINT32_MAX) {
+             // from node not in db
+             ILOG_DEBUG("from node 0x%08x not in db", msg.from);
+             MeshtasticView::addOrUpdateNode(msg.from, msg.ch, 0, eRole::unknown, false, false);
+         } else {
+             ILOG_DEBUG("from node 0x%08x not in db and no need to insert", msg.from);
+-            pos += sprintf(buf, "%04x ", msg.from & 0xffff);
+-        }
+-        uint32_t len = timestamp(buf + pos, msg.time, false);
+-        memcpy(buf + pos + len, msg.bytes, msg.length());
+-        buf[pos + len + msg.length()] = 0;
++            pos += sprintf(buf, "%04x  ", msg.from & 0xffff);
++        }
++        buf[pos] = '\0';
++        timestamp(buf + pos, msg.time, false);
++        const size_t textLen = std::min<size_t>(msg.length(), sizeof(text) - 1);
++        memcpy(text, msg.bytes, textLen);
++        text[textLen] = 0;
+ 
+         lv_obj_t *container = newMessageContainer(msg.from, msg.to, msg.ch);
+         lv_obj_add_flag(container, LV_OBJ_FLAG_HIDDEN);
+-        newMessage(msg.from, container, msg.ch, buf);
++        newMessage(msg.from, container, msg.ch, text, buf);
+     }
+ }
+ 
+@@ -7200,7 +7798,7 @@
+     // ChatsButton
+     lv_obj_t *chatBtn = lv_btn_create(parent_obj);
+     lv_obj_set_pos(chatBtn, 0, 0);
+-    lv_obj_set_size(chatBtn, LV_PCT(100), buttonSize);
++    lv_obj_set_size(chatBtn, LV_PCT(100), 36);
+     lv_obj_add_flag(chatBtn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+     lv_obj_clear_flag(chatBtn, LV_OBJ_FLAG_SCROLLABLE);
+     add_style_home_button_style(chatBtn);
+@@ -7243,8 +7841,10 @@
+             lv_obj_set_size(obj, LV_PCT(100), LV_SIZE_CONTENT);
+             lv_label_set_long_mode(obj, LV_LABEL_LONG_DOT);
+             lv_label_set_text(obj, buf);
+-            lv_obj_set_style_align(obj, LV_ALIGN_LEFT_MID,
++            lv_obj_set_style_align(obj, LV_ALIGN_TOP_LEFT,
+                                    ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            lv_obj_set_style_text_font(obj, &ui_font_montserrat_14,
++                                       ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+             lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_LEFT,
+                                         ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+         }
+@@ -7275,6 +7875,18 @@
+         }
+     }
+ 
++    {
++        // the last message, small, under the name (third child: see setChatPreview)
++        lv_obj_t *preview = lv_label_create(chatBtn);
++        lv_obj_set_size(preview, LV_PCT(96), 12);
++        lv_label_set_long_mode(preview, LV_LABEL_LONG_DOT);
++        lv_label_set_text(preview, "");
++        lv_obj_set_align(preview, LV_ALIGN_BOTTOM_LEFT);
++        lv_obj_set_pos(preview, 0, -1);
++        lv_obj_set_style_text_font(preview, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(preview, lv_color_hex(0xa0a0a0), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    }
++
+     chats[index] = chatBtn;
+     updateActiveChats();
+     if (index > c_max_channels) {
+@@ -7708,12 +8320,23 @@
+ 
+ void TFTView_320x240::updateNodesStatus(void)
+ {
+-    char buf[40];
+-    lv_snprintf(buf, sizeof(buf), _p("%d of %d nodes online", nodeCount), nodesOnline, nodeCount);
++    char buf[64];
++    // of the others: how many heard first-hand, how many on MeshCore
++    int direct = 0, meshcore = 0;
++    for (auto &it : nodes) {
++        if (it.first == ownNode || !it.second || lv_obj_get_child_count(it.second) <= node_tag_idx)
++            continue;
++        if ((long)it.second->LV_OBJ_IDX(node_sig_idx)->user_data == 0)
++            direct++;
++        if (!lv_obj_has_flag(it.second->LV_OBJ_IDX(node_tag_idx), LV_OBJ_FLAG_HIDDEN))
++            meshcore++;
++    }
++    lv_snprintf(buf, sizeof(buf), "%d of %d online\n%d direct, %d MC", (int)nodesOnline, (int)nodeCount, direct, meshcore);
+     lv_label_set_text(objects.home_nodes_label, buf);
+ 
++    lv_snprintf(buf, sizeof(buf), "%d of %d online", (int)nodesOnline, (int)nodeCount);
+     if (nodesFiltered)
+-        lv_snprintf(buf, sizeof(buf), _("Filter: %d of %d nodes"), nodeCount - nodesFiltered, nodeCount);
++        lv_snprintf(buf, sizeof(buf), "%d/%d shown, %d online", (int)(nodeCount - nodesFiltered), (int)nodeCount, (int)nodesOnline);
+     lv_label_set_text(objects.top_nodes_online_label, buf);
+ }
+ 
+@@ -7817,6 +8440,7 @@
+                                     ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+     }
+     lv_label_set_text(objects.home_mail_label, buf);
++    updateTopStatus(); // the count also shows in the top bar, on every screen
+ }
+ 
+ /**
+@@ -8083,7 +8707,8 @@
+ #ifdef ARDUINO_ARCH_ESP32
+         freeHeap = ESP.getFreeHeap();
+         freeHeap_pct = 100 * freeHeap / ESP.getHeapSize();
+-        sprintf(buf, _("Heap: %d (%d%%)\nLVGL: %d (%d%%)"), freeHeap, freeHeap_pct, mon.free_size, 100 - mon.used_pct);
++        sprintf(buf, "Heap %dK free %d%%\nLVGL %dK free %d%%", (int)(freeHeap / 1024), (int)freeHeap_pct,
++                (int)(mon.free_size / 1024), 100 - mon.used_pct);
+ #elif defined(ARCH_PORTDUINO)
+         static uint32_t totalMem = LinuxHelper::getTotalMem();
+         if (totalMem != 0) {
+@@ -8139,9 +8764,14 @@
+                 lastrun10 = curtime;
+                 updateFreeMem();
+ 
+-                if ((db.config.network.wifi_enabled || db.module_config.mqtt.enabled) && !displaydriver->isPowersaving()) {
++                if ((db.config.network.wifi_enabled || db.module_config.mqtt.enabled || db.config.bluetooth.enabled) &&
++                    !displaydriver->isPowersaving()) {
+                     controller->requestDeviceConnectionStatus();
+                 }
++                if (meshcoreUiStatus)
++                    showLoRaFrequency(db.config.lora); // MeshCore starts, stops and retunes on its own
++                updateTopStatus();
++                updateHomeExtras();
+             }
+             if (curtime - lastrun60 >= 60) { // call every 60s
+                 lastrun60 = curtime;
+diff --git a/source/graphics/TFT/Themes.cpp b/source/graphics/TFT/Themes.cpp
+--- a/source/graphics/TFT/Themes.cpp
++++ b/source/graphics/TFT/Themes.cpp
+@@ -134,7 +134,7 @@
+     {0xffaafbff, 0xff003c9f}, // eSettingsPanelText
+     {0, 0xff979797},          // eSettingsPanelBorder
+     {0, 0xff7e7e7e},          // eSettingsPanelShadow
+-    {250, 250},               // eSettingsPanelBgOpa
++    {255, 255},               // eSettingsPanelBgOpa
+     {0xff505050, 0xffeaeae0}, // eSettingsButtonBg
+     {0xffaafbff, 0xff294337}, // eSettingsButtonText
+     {0xff303030, 0xffd0d0d0}, // eSettingsButtonBorder
