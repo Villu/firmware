@@ -1,6 +1,22 @@
 > [!NOTE]
 > This is a personal fork of the Meshtastic firmware. Its branch `meshcore-coexist` adds MeshCore beside Meshtastic on the LilyGo T-Deck Plus; [NOTICE.md](NOTICE.md) says what it is and where its code comes from. It is experimental, it is not an official Meshtastic build, and it is not affiliated with or endorsed by the Meshtastic project. Meshtastic® is a registered trademark of Meshtastic LLC.
 
+### This fork: which radio settings MeshCore and Meshtastic can share
+
+The radio stays on Meshtastic. About every 80 ms it leaves for one channel-activity scan on MeshCore's settings (10–16 ms) and stays there only when the scan finds a frame. That works when all of these hold:
+
+- **MeshCore at SF7 or SF8.** MeshCore sends a 32-symbol preamble only at SF7/SF8; from SF9 up it uses 16 symbols, too short to be caught by scans that come only now and then. Meshtastic's preamble is always 16 symbols, so the roles cannot be swapped either.
+- **A Meshtastic preset other than ShortTurbo, ShortFast or ShortSlow.** A scan has to be well shorter than Meshtastic's preamble (4–16 ms on the Short presets).
+- **MeshCore's channel inside the Meshtastic region's band** (its centre frequency plus and minus half its bandwidth).
+
+| MeshCore settings | NarrowFast, NarrowSlow, MediumFast, MediumSlow, LongFast, LongModerate, LongSlow | ShortTurbo, ShortFast, ShortSlow |
+| --- | --- | --- |
+| SF8 / 62.5 kHz (EU/UK Narrow, 869.618 MHz) | yes | no |
+| SF7 / 62.5 kHz (US/Canada 910.525 MHz, CZ, AU/NZ narrow) | yes | no |
+| SF9 and up (any bandwidth) | no | no |
+
+Settings that do not fit are refused when the MeshCore app sets them. If the Meshtastic preset is changed to one that does not fit, MeshCore pauses and Meshtastic runs alone until it fits again. Measured on the air only with Meshtastic NarrowFast (region `EU_N_868`) and MeshCore EU/UK Narrow; the other "yes" cells follow from the same timing rule (`sideChannelFits()` in `src/mesh/SX126xSideChannel.inl`) and are untested.
+
 <div align="center" markdown="1">
 
 <img src=".github/meshtastic_logo.png" alt="Meshtastic Logo" width="80"/>
