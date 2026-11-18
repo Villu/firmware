@@ -12,6 +12,7 @@
 #include "Router.h"
 #include "RoutingModule.h"
 #include "Throttle.h"
+#include "TypeConversions.h"
 #include "airtime.h"
 #include "gps/RTC.h"
 #include "main.h"
@@ -465,6 +466,23 @@ extern "C" bool firmwareGpsStatus(uint32_t *satellites)
     if (satellites)
         *satellites = gpsStatus ? gpsStatus->getNumSatellites() : 0;
     return gpsStatus && gpsStatus->getHasLock();
+}
+
+// All the node database has about a node, as the User a NodeInfo carries (names, hardware, role, public key). For the
+// screen's contact QR code and its "exchange info": the screen itself only keeps the names.
+extern "C" bool firmwareNodeUser(uint32_t nodeNum, meshtastic_User *user)
+{
+    if (!user)
+        return false;
+    if (nodeNum == nodeDB->getNodeNum()) {
+        *user = owner;
+        return true;
+    }
+    const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeNum);
+    if (!node)
+        return false;
+    *user = TypeConversions::ConvertToUser(node);
+    return true;
 }
 
 // How long a text of this length is on the air, in ms: on Meshtastic as the radio driver counts it, on MeshCore as a
