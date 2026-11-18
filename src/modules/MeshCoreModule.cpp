@@ -219,6 +219,8 @@ class Host : public meshcore_host::Platform, public meshcore_host::Events
     bool enabled = true; // false: the radio stays on Meshtastic (see the class comment in MeshCoreModule.h)
     float freqMHz() const { return lastFreqMHz; }
     float bwKHz() const { return lastBwKHz; }
+    uint8_t sf() const { return lastSf; }
+    uint8_t cr() const { return lastCr; }
 
     void setEnabled(bool on)
     {
@@ -463,6 +465,45 @@ extern "C" bool firmwareGpsStatus(uint32_t *satellites)
     if (satellites)
         *satellites = gpsStatus ? gpsStatus->getNumSatellites() : 0;
     return gpsStatus && gpsStatus->getHasLock();
+}
+
+// How long a text of this length is on the air, in ms: on Meshtastic as the radio driver counts it, on MeshCore as a
+// Public-channel frame (header, path length, channel hash, 2 bytes of MAC, then time, a flag byte and "name: text"
+// in 16-byte blocks) with MeshCore's 32-symbol preamble. For the count beside the screen's text field.
+extern "C" uint32_t firmwareTextAirtimeMs(uint32_t textLength, bool meshcore)
+{
+    if (!meshcore)
+        return RadioLibInterface::instance ? RadioLibInterface::instance->getPacketTime(textLength + 16 + 6) : 0;
+    const float bwHz = host.bwKHz() * 1000.0f;
+    const int sf = host.sf();
+    const int crDen = host.cr() >= 5 && host.cr() <= 8 ? host.cr() : 8;
+    if (bwHz <= 0 || sf < 6 || sf > 12)
+        return 0;
+    meshcore_host::Status st;
+    meshcore_host::getStatus(st);
+    const uint32_t plain = 4 + 1 + strlen(st.nodeName) + 2 + textLength;
+    const int bytes = 5 + (int)((plain + 15) / 16 * 16);
+    const float symbolMs = (float)(1u << sf) * 1000.0f / bwHz;
+    const int lowRate = symbolMs > 16.0f ? 1 : 0;
+    const int num = 8 * bytes - 4 * sf + 28 + 16;
+    const int den = 4 * (sf - 2 * lowRate);
+    const int payloadSymbols = 8 + (num > 0 ? (num + den - 1) / den * crDen : 0);
+    return (uint32_t)((32 + 4.25f + payloadSymbols) * symbolMs);
+}
+
+// And the position this node has for itself (its GPS, or a fixed one). The screen cannot get it any other way while
+// position sharing is off on every channel: no position report is made then, not even for the screen.
+extern "C" bool firmwareGpsPosition(int32_t *latitudeI, int32_t *longitudeI, int32_t *altitude)
+{
+    if (localPosition.latitude_i == 0 && localPosition.longitude_i == 0)
+        return false;
+    if (latitudeI)
+        *latitudeI = localPosition.latitude_i;
+    if (longitudeI)
+        *longitudeI = localPosition.longitude_i;
+    if (altitude)
+        *altitude = localPosition.altitude;
+    return true;
 }
 
 MeshCoreModule::MeshCoreModule() : concurrency::OSThread("MeshCore") {}

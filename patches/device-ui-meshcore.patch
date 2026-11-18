@@ -1,3 +1,23 @@
+diff --git a/include/graphics/common/ViewController.h b/include/graphics/common/ViewController.h
+--- a/include/graphics/common/ViewController.h
++++ b/include/graphics/common/ViewController.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "comms/IClientBase.h"
++#include "util/LogMessage.h"
+ #include "util/LogRotate.h"
+ #include <time.h>
+ 
+@@ -64,6 +65,8 @@
+     virtual bool sendConfig(meshtastic_ModuleConfig_PaxcounterConfig &&paxCounter, uint32_t nodeId = 0);
+ 
+     virtual bool sendConfig(const char ringtone[231], uint32_t nodeId = 0);
++    // what became of a text we sent at msgTime: an entry with no text, read back by the view at the next start
++    virtual void logMessageStatus(uint32_t to, uint8_t ch, uint32_t msgTime, LogMessage::MsgStatus status);
+     virtual void sendTextMessage(uint32_t to, uint8_t ch, uint8_t hopLimit, uint32_t msgTime, uint32_t requestId, bool usePkc,
+                                  const char *textmsg);
+     virtual void removeTextMessages(uint32_t from, uint32_t to, uint8_t ch);
 diff --git a/include/graphics/view/TFT/TFTView_320x240.h b/include/graphics/view/TFT/TFTView_320x240.h
 --- a/include/graphics/view/TFT/TFTView_320x240.h
 +++ b/include/graphics/view/TFT/TFTView_320x240.h
@@ -11,16 +31,17 @@ diff --git a/include/graphics/view/TFT/TFTView_320x240.h b/include/graphics/view
      // create empty message container for node or group channel
      virtual lv_obj_t *newMessageContainer(uint32_t from, uint32_t to, uint8_t ch);
      // filter or highlight node
-@@ -275,6 +276,8 @@
+@@ -275,6 +276,9 @@
      void setBellText(bool banner, bool sound);
      void setChannelName(const meshtastic_Channel &ch);
      uint32_t timestamp(char *buf, uint32_t time, bool update);
 +    void updateTopStatus(void);
 +    void updateHomeExtras(void);
++    void updateMessageCounter(void);
      void updateLocationMap(uint32_t objects);
      void attribution(std::string url);
  
-@@ -300,6 +303,7 @@
+@@ -300,6 +304,7 @@
      static void ui_event_SettingsButton(lv_event_t *e);
  
      static void ui_event_NodeButton(lv_event_t *e);
@@ -28,10 +49,42 @@ diff --git a/include/graphics/view/TFT/TFTView_320x240.h b/include/graphics/view
      static void ui_event_ChannelButton(lv_event_t *e);
      static void ui_event_ChatButton(lv_event_t *e);
      static void ui_event_ChatDelButton(lv_event_t *e);
+diff --git a/source/graphics/common/MeshtasticView.cpp b/source/graphics/common/MeshtasticView.cpp
+--- a/source/graphics/common/MeshtasticView.cpp
++++ b/source/graphics/common/MeshtasticView.cpp
+@@ -152,7 +152,16 @@
+ {
+     time_t curtime;
+     time(&curtime);
++    // Until the clock is set time() counts seconds since the start. A time from the node database (wall time) and
++    // such a count, or the other way round, have no difference worth showing.
++    const bool clockSet = curtime > 1000000, stampSet = lastHeard > 1000000;
++    if (clockSet != stampSet) {
++        strcpy(buf, clockSet ? "" : "?");
++        return false;
++    }
+     time_t timediff = curtime - lastHeard;
++    if (timediff < 0)
++        timediff = 0;
+     if (timediff < 60)
+         strcpy(buf, _("now"));
+     else if (timediff < 3600)
 diff --git a/source/graphics/common/ViewController.cpp b/source/graphics/common/ViewController.cpp
 --- a/source/graphics/common/ViewController.cpp
 +++ b/source/graphics/common/ViewController.cpp
-@@ -717,6 +717,10 @@
+@@ -468,6 +468,11 @@
+ void ViewController::setConfigRequested(bool required)
+ {
+     requestConfigRequired = required;
++}
++
++void ViewController::logMessageStatus(uint32_t to, uint8_t ch, uint32_t msgTime, LogMessage::MsgStatus status)
++{
++    log.write(LogMessageEnv(myNodeNum, to, ch, msgTime, status, false, 0, nullptr));
+ }
+ 
+ void ViewController::sendTextMessage(uint32_t to, uint8_t ch, uint8_t hopLimit, uint32_t msgTime, uint32_t requestId, bool usePkc,
+@@ -717,6 +722,10 @@
                      view->addOrUpdateNode(node.num, node.channel, node.last_heard, MeshtasticView::eRole::unknown, false,
                                            node.via_mqtt);
                  }
@@ -42,10 +95,51 @@ diff --git a/source/graphics/common/ViewController.cpp b/source/graphics/common/
                  if (node.has_position) {
                      view->updatePosition(node.num, node.position.latitude_i, node.position.longitude_i, node.position.altitude, 0,
                                           node.position.precision_bits);
+diff --git a/source/graphics/map/MapPanel.cpp b/source/graphics/map/MapPanel.cpp
+--- a/source/graphics/map/MapPanel.cpp
++++ b/source/graphics/map/MapPanel.cpp
+@@ -102,6 +102,7 @@
+             tiles[hash] = std::move(std::unique_ptr<MapTile>(new MapTile(xStart + x, yStart + y)));
+             loadTile(hash, x * size + xOffset, y * size + yOffset);
+             x++;
++            break; // one tile a pass, so input is read in between
+         } else {
+             if (y < tilesY) {
+                 x = 0;
+@@ -495,10 +496,14 @@
+ void MapPanel::update(uint32_t id, float lat, float lon)
+ {
+     auto it = mapObjects.find(id);
+-    if (it != mapObjects.end()) {
+-        it->second->point = GeoPoint(lat, lon, MapTileSettings::getZoomLevel());
+-    }
+-    drawObject(*it->second);
++    if (it == mapObjects.end())
++        return; // (it was dereferenced all the same)
++    MapObject &obj = *it->second;
++    const bool wasVisible = obj.point.isVisible, filtered = obj.point.isFiltered;
++    obj.point = GeoPoint(lat, lon, MapTileSettings::getZoomLevel());
++    obj.point.isFiltered = filtered; // a new point is not a reason to show a node the list has filtered out
++    drawObject(obj);
++    objectsOnMap += (int)obj.point.isVisible - (int)wasVisible;
+ }
+ 
+ void MapPanel::update(uint32_t id, bool filtered)
+@@ -506,8 +511,10 @@
+     auto it = mapObjects.find(id);
+     if (it != mapObjects.end() && it->second->point.isFiltered != filtered) {
+         // only update if filter state changed
++        const bool wasVisible = it->second->point.isVisible;
+         it->second->point.isFiltered = filtered;
+         drawObject(*it->second);
++        objectsOnMap += (int)it->second->point.isVisible - (int)wasVisible; // the title's count follows at once
+     }
+ }
+ 
 diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTView_320x240.cpp
 --- a/source/graphics/TFT/TFTView_320x240.cpp
 +++ b/source/graphics/TFT/TFTView_320x240.cpp
-@@ -83,6 +83,89 @@
+@@ -83,6 +83,99 @@
  #define CR_REPLACEMENT 0x0C              // dummy to record several lines in a one line textarea
  #define THIS TFTView_320x240::instance() // need to use this in all static methods
  
@@ -59,7 +153,17 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +// MeshCore's counters as text: 0 two short lines (home screen), 1 the statistics page, 2 a line for About
 +extern "C" void meshcoreUiCounters(char *text, size_t len, int kind) __attribute__((weak));
 +
++// The position the firmware has for this device (its GPS, or a fixed one); false while it has none. The screen
++// otherwise only learns it from a position report, which is not sent while position sharing is off.
++extern "C" bool firmwareGpsPosition(int32_t *latitudeI, int32_t *longitudeI, int32_t *altitude) __attribute__((weak));
++
++// How long a text of this many bytes is on the air, in ms, on Meshtastic or (meshcore) on MeshCore; 0 if unknown
++extern "C" uint32_t firmwareTextAirtimeMs(uint32_t textLength, bool meshcore) __attribute__((weak));
++
 +static uint32_t ownSats = 0; // satellites in the last position this device reported
++static lv_obj_t *messageCounter = nullptr; // "12/220  0.4 s" at the right end of the text field
++static lv_obj_t *sendOverlay = nullptr;    // turns the keyboard button into Send while there is text
++static lv_obj_t *homeQrCaption = nullptr;
 +static lv_obj_t *homeMcLabel = nullptr;  // MeshCore's cell on the home screen
 +static lv_obj_t *statsMcLabel = nullptr; // MeshCore's block under the statistics table
 +static lv_obj_t *aboutDeviceLabel = nullptr;
@@ -135,7 +239,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  #define LV_COLOR_HEX(C) {.blue = (C >> 0) & 0xff, .green = (C >> 8) & 0xff, .red = (C >> 16) & 0xff}
  
  #define VALID_TIME(T) (T > 1000000 && T < UINT32_MAX)
-@@ -111,8 +194,235 @@
+@@ -111,8 +204,481 @@
      node_pos1_idx,
      node_pos2_idx,
      node_tm1_idx,
@@ -143,7 +247,8 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +    node_tm2_idx,
 +    node_tag_idx, // which network / "this device"
 +    node_msg_idx, // the Message button of the opened row
-+    node_id_idx   // node number and role, in the opened row
++    node_id_idx,  // node number and role, in the opened row
++    node_map_idx  // "Show on map", in the opened row of a node with a position
  };
 +
 +// A small coloured word beside a node's short name
@@ -165,15 +270,54 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +}
 +
 +// MeshCore nodes carry " [MC]" at the end of their name (the firmware's MeshCoreModule): show the tag for those
-+static void setNetworkTag(lv_obj_t *panel, const char *longName)
++static bool isMeshCoreName(const char *longName)
++{
++    const size_t len = longName ? strlen(longName) : 0;
++    return len >= 5 && strcmp(longName + len - 5, " [MC]") == 0;
++}
++
++// What the pictures only hint at: the role of a node that is not a plain client
++static const char *roleTag(int role)
++{
++    switch (role) {
++    case meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE:
++        return "mute";
++    case meshtastic_Config_DeviceConfig_Role_ROUTER:
++    case meshtastic_Config_DeviceConfig_Role_ROUTER_LATE:
++        return "router";
++    case meshtastic_Config_DeviceConfig_Role_REPEATER:
++        return "repeater";
++    case meshtastic_Config_DeviceConfig_Role_TRACKER:
++    case meshtastic_Config_DeviceConfig_Role_TAK_TRACKER:
++        return "tracker";
++    case meshtastic_Config_DeviceConfig_Role_SENSOR:
++        return "sensor";
++    case meshtastic_Config_DeviceConfig_Role_TAK:
++        return "TAK";
++    case meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN:
++        return "hidden";
++    case meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND:
++        return "lost+found";
++    case meshtastic_Config_DeviceConfig_Role_CLIENT_BASE:
++        return "base";
++    default:
++        return nullptr;
++    }
++}
++
++static void setNetworkTag(lv_obj_t *panel, const char *longName, int role)
 +{
 +    if (panel == objects.node_panel || lv_obj_get_child_count(panel) <= node_tag_idx)
 +        return;
-+    const size_t len = strlen(longName);
-+    if (len >= 5 && strcmp(longName + len - 5, " [MC]") == 0)
-+        lv_obj_remove_flag(panel->LV_OBJ_IDX(node_tag_idx), LV_OBJ_FLAG_HIDDEN);
-+    else
-+        lv_obj_add_flag(panel->LV_OBJ_IDX(node_tag_idx), LV_OBJ_FLAG_HIDDEN);
++    lv_obj_t *tag = panel->LV_OBJ_IDX(node_tag_idx);
++    const char *word = isMeshCoreName(longName) ? "MeshCore" : roleTag(role);
++    if (word) {
++        lv_label_set_text(tag, word);
++        lv_obj_set_style_bg_color(tag, lv_color_hex(word[0] == 'M' && word[1] == 'e' ? 0xff8c04 : 0x9ab8ba), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_remove_flag(tag, LV_OBJ_FLAG_HIDDEN);
++    } else {
++        lv_obj_add_flag(tag, LV_OBJ_FLAG_HIDDEN);
++    }
 +}
 +
 +// A node's row. Closed, two lines beside the picture: short name (and distance), how it is reached, when it was last
@@ -208,10 +352,13 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +}
 +
 +// The line under a chat's name in the chat list: when, who, and the start of the last message. Newest chat on top.
-+static void setChatPreview(lv_obj_t *chatButton, const char *when, const char *who, const char *text)
++static void setChatPreview(lv_obj_t *chatButton, uint32_t index, const char *when, const char *who, const char *text)
 +{
 +    if (!chatButton || lv_obj_get_child_count(chatButton) < 3)
 +        return;
++    static lv_obj_t *const channelButtons[] = {objects.channel_button0, objects.channel_button1, objects.channel_button2,
++                                               objects.channel_button3, objects.channel_button4, objects.channel_button5,
++                                               objects.channel_button6, objects.channel_button7};
 +    char line[80];
 +    lv_snprintf(line, sizeof(line), "%s%s%s%s%s", when ? when : "", when && when[0] ? "  " : "", who ? who : "",
 +                who && who[0] ? ": " : "", text ? text : "");
@@ -220,6 +367,159 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +            *at = ' ';
 +    lv_label_set_text(lv_obj_get_child(chatButton, 2), line);
 +    lv_obj_move_to_index(chatButton, 0);
++
++    // a channel: the same line under its name on the Group Channels page (name, lock and bell are its first three
++    // children; the line is made when first needed, as the fourth)
++    if (index < sizeof(channelButtons) / sizeof(channelButtons[0]) && channelButtons[index]) {
++        lv_obj_t *button = channelButtons[index];
++        if (lv_obj_get_child_count(button) == 3) {
++            lv_obj_t *preview = lv_label_create(button);
++            lv_obj_set_size(preview, LV_PCT(74), 12);
++            lv_label_set_long_mode(preview, LV_LABEL_LONG_DOT);
++            lv_obj_set_align(preview, LV_ALIGN_BOTTOM_MID);
++            lv_obj_set_pos(preview, 0, 1);
++            lv_obj_set_style_text_font(preview, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            lv_obj_set_style_text_color(preview, lv_color_hex(0xa0a0a0), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            lv_obj_set_style_text_align(preview, LV_TEXT_ALIGN_CENTER, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            lv_obj_set_height(button, 40); // two lines need a higher button
++            lv_obj_set_style_translate_y(lv_obj_get_child(button, 0), -8, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT)); // the name moves up to make room
++        }
++        if (lv_obj_get_child_count(button) > 3)
++            lv_label_set_text(lv_obj_get_child(button, 3), line);
++    }
++}
++
++// How many messages came into a chat since it was last opened: a number at the right of its row in the chat list
++static void setChatUnread(lv_obj_t *chatButton, bool oneMore)
++{
++    if (!chatButton || lv_obj_get_child_count(chatButton) < 4)
++        return;
++    lv_obj_t *badge = lv_obj_get_child(chatButton, 3);
++    const uint32_t count = oneMore ? (uint32_t)(unsigned long)badge->user_data + 1 : 0;
++    badge->user_data = (void *)(unsigned long)count;
++    if (count) {
++        lv_label_set_text_fmt(badge, "%u", (unsigned)count);
++        lv_obj_remove_flag(badge, LV_OBJ_FLAG_HIDDEN);
++    } else {
++        lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_set_style_border_color(chatButton, lv_color_hex(0x808080), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    }
++}
++
++// The settings list: nineteen full-width buttons were three screens of scrolling. Two columns of lower ones.
++static void compactSettings(void)
++{
++    lv_obj_t *page = objects.tab_page_basic_settings;
++    if (!page)
++        return;
++    lv_obj_set_style_flex_flow(page, LV_FLEX_FLOW_ROW_WRAP, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_column(page, 4, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_row(page, 3, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_top(page, 4, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_left(page, 4, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    for (uint32_t i = 0; i < lv_obj_get_child_count(page); i++) {
++        lv_obj_t *button = lv_obj_get_child(page, i);
++        if (!lv_obj_check_type(button, &lv_button_class))
++            continue;
++        lv_obj_set_size(button, LV_PCT(48), 24);
++        lv_obj_set_style_pad_hor(button, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT)); // the text needs the width
++        for (uint32_t j = 0; j < lv_obj_get_child_count(button); j++) {
++            lv_obj_t *label = lv_obj_get_child(button, j);
++            if (!lv_obj_check_type(label, &lv_label_class))
++                continue;
++            lv_obj_set_style_text_font(label, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
++            lv_obj_set_height(label, 12);
++        }
++    }
++}
++
++// The map's scale: a bar of a round length above the coordinates, redone when the zoom (or the latitude) changes
++static void updateMapScale(void)
++{
++    static lv_obj_t *bar = nullptr, *text = nullptr;
++    static int shownZoom = -1, shownLat = 1000;
++    if (!objects.map_location_label)
++        return;
++    const double lat = atof(lv_label_get_text(objects.map_location_label)); // the line reads "<lat> <lon>"
++    const int zoom = MapTileSettings::getZoomLevel();
++    if (lat == 0 || (zoom == shownZoom && (int)lat == shownLat))
++        return;
++    shownZoom = zoom;
++    shownLat = (int)lat;
++    if (!bar) {
++        lv_obj_t *parent = lv_obj_get_parent(objects.map_location_label);
++        bar = lv_obj_create(parent);
++        lv_obj_remove_style_all(bar);
++        lv_obj_set_style_bg_color(bar, lv_color_hex(0x000000), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_opa(bar, 255, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_border_color(bar, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_border_width(bar, 1, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_remove_flag(bar, LV_OBJ_FLAG_CLICKABLE);
++        text = lv_label_create(parent);
++        lv_obj_set_style_text_font(text, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(text, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_color(text, lv_color_hex(0x000000), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_opa(text, 150, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_pad_hor(text, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_remove_flag(text, LV_OBJ_FLAG_CLICKABLE);
++    }
++    const double metresPerPixel = 156543.03392 * cos(lat * 3.14159265358979 / 180.0) / (double)(1UL << zoom);
++    static const uint32_t lengths[] = {10,    20,    50,    100,    200,    500,    1000,   2000,
++                                       5000,  10000, 20000, 50000,  100000, 200000, 500000, 1000000};
++    uint32_t length = lengths[0];
++    for (uint32_t candidate : lengths)
++        if (candidate / metresPerPixel <= 80)
++            length = candidate;
++    const int32_t pixels = (int32_t)(length / metresPerPixel);
++    lv_obj_set_size(bar, pixels < 4 ? 4 : pixels, 5);
++    lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, 4, -17);
++    if (length >= 1000)
++        lv_label_set_text_fmt(text, "%u km", (unsigned)(length / 1000));
++    else
++        lv_label_set_text_fmt(text, "%u m", (unsigned)length);
++    lv_obj_align_to(text, bar, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
++}
++
++// The map's style panel: say what the two sliders and the two boxes are, and give it a way out
++static void dressMapPanel(void)
++{
++    lv_obj_t *panel = objects.map_osd_panel;
++    if (!panel || !objects.map_brightness_slider || !objects.map_contrast_slider || !objects.map_style_dropdown ||
++        !objects.map_url_dropdown)
++        return;
++    lv_obj_set_style_bg_opa(panel, 215, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT)); // it was see-through: text on the map could not be read
++    lv_obj_set_style_radius(panel, 8, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_y(objects.map_brightness_slider, 20);
++    lv_obj_set_y(objects.map_contrast_slider, 50);
++    lv_obj_set_y(objects.map_style_dropdown, 76);
++    lv_obj_set_y(objects.map_url_dropdown, 122);
++    static const struct {
++        const char *text;
++        int32_t y;
++    } names[] = {{"Brightness", 4}, {"Contrast", 34}, {"Map style", 63}, {"Tiles not on the card come from", 109}};
++    for (const auto &name : names) {
++        lv_obj_t *label = lv_label_create(panel);
++        lv_label_set_text(label, name.text);
++        lv_obj_set_align(label, LV_ALIGN_TOP_LEFT);
++        lv_obj_set_pos(label, 28, name.y);
++        lv_obj_set_style_text_font(label, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(label, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    }
++    lv_obj_t *close = lv_button_create(panel);
++    lv_obj_set_size(close, 24, 24);
++    lv_obj_set_align(close, LV_ALIGN_TOP_RIGHT);
++    lv_obj_set_pos(close, -2, 2);
++    lv_obj_set_style_bg_color(close, lv_color_hex(0x606060), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_radius(close, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_shadow_width(close, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_t *cross = lv_label_create(close);
++    lv_label_set_text(cross, LV_SYMBOL_CLOSE);
++    lv_obj_center(cross);
++    lv_obj_set_style_text_font(cross, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_text_color(cross, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_add_event_cb(
++        close, [](lv_event_t *) { lv_obj_add_flag(objects.map_osd_panel, LV_OBJ_FLAG_HIDDEN); }, LV_EVENT_CLICKED, nullptr);
 +}
 +
 +// The home screen's pictures are button backgrounds, which cannot be drawn smaller. Each button gets a small copy of
@@ -238,8 +538,14 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +        const void *src = lv_obj_get_style_bg_image_src(button, LV_PART_MAIN);
 +        if (src && lv_image_get_src(icon) != src)
 +            lv_image_set_src(icon, src);
-+        lv_obj_set_style_image_recolor(icon, lv_obj_get_style_bg_image_recolor(button, LV_PART_MAIN), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
-+        lv_obj_set_style_image_recolor_opa(icon, lv_obj_get_style_bg_image_recolor_opa(button, LV_PART_MAIN), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        // only when it changed: setting a style redraws the picture, and this runs twice a second
++        const lv_color_t color = lv_obj_get_style_bg_image_recolor(button, LV_PART_MAIN);
++        const lv_opa_t opa = lv_obj_get_style_bg_image_recolor_opa(button, LV_PART_MAIN);
++        if (!lv_color_eq(lv_obj_get_style_image_recolor(icon, LV_PART_MAIN), color) ||
++            lv_obj_get_style_image_recolor_opa(icon, LV_PART_MAIN) != opa) {
++            lv_obj_set_style_image_recolor(icon, color, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            lv_obj_set_style_image_recolor_opa(icon, opa, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        }
 +    }
 +}
 +
@@ -276,9 +582,11 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +        lv_obj_move_to_index(homeMcLabel, lv_obj_get_index(button) + 1);
 +    }
 +
++    lv_obj_t *lastButton = nullptr;
 +    for (uint32_t i = 0; i < lv_obj_get_child_count(box); i++) {
 +        lv_obj_t *child = lv_obj_get_child(box, i);
 +        if (lv_obj_check_type(child, &lv_button_class)) {
++            lastButton = child;
 +            lv_obj_set_size(child, 24, 24);
 +            lv_obj_set_ext_click_area(child, 3);
 +            if (lv_obj_get_style_bg_image_src(child, LV_PART_MAIN)) {
@@ -294,6 +602,18 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +            lv_label_set_long_mode(child, LV_LABEL_LONG_CLIP);
 +            lv_obj_set_style_text_font(child, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
 +            lv_obj_set_style_text_line_space(child, -1, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            if (lastButton) {
++                // the picture is 24 px: a tap or long press on the text beside it counts for it
++                lv_obj_add_flag(child, LV_OBJ_FLAG_CLICKABLE);
++                lv_obj_add_event_cb(
++                    child,
++                    [](lv_event_t *e) {
++                        const lv_event_code_t code = lv_event_get_code(e);
++                        if (code == LV_EVENT_CLICKED || code == LV_EVENT_LONG_PRESSED)
++                            lv_obj_send_event((lv_obj_t *)lv_event_get_user_data(e), code, lv_event_get_param(e));
++                    },
++                    LV_EVENT_ALL, lastButton);
++            }
 +        }
 +    }
 +    syncHomeIcons(nullptr);
@@ -355,6 +675,36 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +    }
 +}
 +
++// What became of a message we sent, on its row: the bubble's border, and the word after the time on the small line
++// ("<date time>  <status>"). The bubble remembers the status, so a repeat changes nothing; true if it changed.
++static bool applySentStatus(lv_obj_t *row, LogMessage::MsgStatus status, bool toChannel)
++{
++    if (!row || lv_obj_get_child_count(row) < 2)
++        return false;
++    lv_obj_t *bubble = lv_obj_get_child(row, 0);
++    lv_obj_t *metaLabel = lv_obj_get_child(row, 1);
++    if ((unsigned long)bubble->user_data == (unsigned long)status)
++        return false;
++    bubble->user_data = (void *)(unsigned long)status;
++    const bool failed = status == LogMessage::eFailed, acked = status == LogMessage::eAcked;
++    lv_obj_set_style_border_color(bubble, failed ? colorRed : acked ? colorBlueGreen : colorYellow,
++                                  ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    char meta[48];
++    lv_snprintf(meta, sizeof(meta), "%s", lv_label_get_text(metaLabel));
++    char *sep = strstr(meta, "  ");
++    char *at = sep ? sep + 2 : (meta[0] >= '0' && meta[0] <= '9') ? meta + strlen(meta) : meta;
++    if (!sep && at != meta && sizeof(meta) - (at - meta) > 3) {
++        strcpy(at, "  ");
++        at += 2;
++    }
++    lv_snprintf(at, sizeof(meta) - (at - meta), "%s", sentStatusWord(status, toChannel));
++    lv_label_set_text(metaLabel, meta);
++    lv_obj_set_style_text_color(metaLabel,
++                                failed ? colorRed : acked && !toChannel ? colorMesh : lv_color_hex(0xa0a0a0),
++                                ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    return true;
++}
++
 +// The small line above a message bubble: who and when, and for our own messages what became of them
 +static lv_obj_t *makeMessageMeta(lv_obj_t *row, lv_obj_t *bubble, const char *text, bool right)
 +{
@@ -372,7 +722,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
  enum ScrollDirection {
      scrollDownLeft = 1,
-@@ -304,8 +614,23 @@
+@@ -304,8 +870,55 @@
      lv_textarea_set_text(objects.nodes_hl_name_area, highlight.node_name);
  
      // initialize own node panel
@@ -384,6 +734,38 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +        compactNodeRow(objects.node_panel);
 +    }
 +    compactHome();
++    dressMapPanel();
++    compactSettings();
++    // the map's coordinate line: readable whatever is under it
++    lv_obj_set_style_text_color(objects.map_location_label, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_bg_color(objects.map_location_label, lv_color_hex(0x000000), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_bg_opa(objects.map_location_label, 150, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_pad_hor(objects.map_location_label, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    // the text field: count and airtime as it is typed
++    lv_obj_add_event_cb(
++        objects.message_input_area, [](lv_event_t *) { THIS->updateMessageCounter(); }, LV_EVENT_VALUE_CHANGED, nullptr);
++    updateMessageCounter();
++    // the packet log listens from the start, not only while its page is open
++    packetLogEnabled = true;
++    updateTopStatus(); // the indicators are there from the start, not from the first 10 s tick
++    // a tap on the node list's title takes every filter off
++    lv_obj_add_flag(objects.top_nodes_panel, LV_OBJ_FLAG_CLICKABLE);
++    lv_obj_add_event_cb(
++        objects.top_nodes_panel,
++        [](lv_event_t *) {
++            if (!THIS->nodesFiltered)
++                return;
++            lv_obj_set_state(objects.nodes_filter_unknown_switch, LV_STATE_CHECKED, false);
++            lv_obj_set_state(objects.nodes_filter_offline_switch, LV_STATE_CHECKED, false);
++            lv_obj_set_state(objects.nodes_filter_public_key_switch, LV_STATE_CHECKED, false);
++            lv_obj_set_state(objects.nodes_filter_position_switch, LV_STATE_CHECKED, false);
++            lv_dropdown_set_selected(objects.nodes_filter_channel_dropdown, 0);
++            lv_dropdown_set_selected(objects.nodes_filter_hops_dropdown, 0);
++            lv_textarea_set_text(objects.nodes_filter_name_area, "");
++            THIS->updateNodesFiltered(true);
++            THIS->storeNodeOptions();
++        },
++        LV_EVENT_CLICKED, nullptr);
 +    // the Wi-Fi password is not for everyone who sees the screen
 +    lv_textarea_set_password_mode(objects.settings_wifi_password_textarea, true);
 +    // dialogs: nothing of the list behind them is to show through
@@ -397,7 +779,47 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      // touch screen calibration data
      uint16_t *parameters = (uint16_t *)db.uiConfig.calibration_data.bytes;
-@@ -730,6 +1055,10 @@
+@@ -680,17 +1293,17 @@
+     lv_obj_add_event_cb(objects.statistics_table, ui_event_statistics_table, LV_EVENT_DRAW_TASK_ADDED, NULL);
+     lv_obj_add_flag(objects.statistics_table, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);
+     // statistics table item size
+-    int32_t width = 36;
++    int32_t width = 32;
+     int32_t rows = 12;
+     if (h > 320) {
+-        width = (h - 48 - 57) / 6;
++        width = (h - 48 - 57) / 7;
+     }
+     if (v > 240) {
+         rows = (v - 32) / 18;
+     }
+     statisticTableRows = rows;
+     lv_table_set_row_count(objects.statistics_table, statisticTableRows);
+-    lv_table_set_column_count(objects.statistics_table, 7);
++    lv_table_set_column_count(objects.statistics_table, 8);
+     lv_table_set_column_width(objects.statistics_table, 0, 57);
+     lv_table_set_column_width(objects.statistics_table, 1, width);
+     lv_table_set_column_width(objects.statistics_table, 2, width);
+@@ -698,14 +1311,16 @@
+     lv_table_set_column_width(objects.statistics_table, 4, width);
+     lv_table_set_column_width(objects.statistics_table, 5, width);
+     lv_table_set_column_width(objects.statistics_table, 6, width);
++    lv_table_set_column_width(objects.statistics_table, 7, width);
+     // fill table heading
+     lv_table_set_cell_value(objects.statistics_table, 0, 0, _("Name"));
+     lv_table_set_cell_value(objects.statistics_table, 0, 1, "Tel");
+     lv_table_set_cell_value(objects.statistics_table, 0, 2, "Pos");
+     lv_table_set_cell_value(objects.statistics_table, 0, 3, "Inf");
+     lv_table_set_cell_value(objects.statistics_table, 0, 4, "Trc");
+-    lv_table_set_cell_value(objects.statistics_table, 0, 5, "Nbr");
+-    lv_table_set_cell_value(objects.statistics_table, 0, 6, "All");
++    lv_table_set_cell_value(objects.statistics_table, 0, 5, "Txt");
++    lv_table_set_cell_value(objects.statistics_table, 0, 6, "Nbr");
++    lv_table_set_cell_value(objects.statistics_table, 0, 7, "All");
+ 
+     // transform checkbox into radio button
+     static lv_style_t style_radio;
+@@ -730,6 +1345,10 @@
          lv_label_set_text(obj, label);
      };
  
@@ -408,7 +830,24 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      char fw[128];
      snprintf(fw, sizeof(fw), ABOUT_FIRMWARE_TEXT, firmware_version);
      createLabel(objects.settings_about_panel, fw);
-@@ -1123,7 +1452,11 @@
+@@ -815,7 +1434,7 @@
+     lv_obj_add_event_cb(objects.home_location_button, this->ui_event_LocationButton, LV_EVENT_LONG_PRESSED, NULL);
+     lv_obj_add_event_cb(objects.home_wlan_button, this->ui_event_WLANButton, LV_EVENT_LONG_PRESSED, NULL);
+     lv_obj_add_event_cb(objects.home_mqtt_button, this->ui_event_MQTTButton, LV_EVENT_ALL, NULL);
+-    lv_obj_add_event_cb(objects.home_sd_card_button, this->ui_event_SDCardButton, LV_EVENT_CLICKED, NULL);
++    lv_obj_add_event_cb(objects.home_sd_card_button, this->ui_event_SDCardButton, LV_EVENT_ALL, NULL);
+     lv_obj_add_event_cb(objects.home_memory_button, this->ui_event_MemoryButton, LV_EVENT_CLICKED, NULL);
+     lv_obj_add_event_cb(objects.home_qr_button, this->ui_event_QrButton, LV_EVENT_CLICKED, NULL);
+     lv_obj_add_event_cb(objects.home_cancel_qr_button, this->ui_event_CancelQrButton, LV_EVENT_CLICKED, NULL);
+@@ -842,6 +1461,7 @@
+ 
+     // keyboard
+     lv_obj_add_event_cb(objects.keyboard, ui_event_Keyboard, LV_EVENT_CLICKED, this);
++    lv_obj_add_event_cb(objects.keyboard, ui_event_Keyboard, LV_EVENT_CANCEL, this); // its keyboard / X key
+     lv_obj_add_event_cb(objects.keyboard_button_0, ui_event_KeyboardButton, LV_EVENT_CLICKED, (void *)0);
+     lv_obj_add_event_cb(objects.keyboard_button_1, ui_event_KeyboardButton, LV_EVENT_CLICKED, (void *)1);
+     lv_obj_add_event_cb(objects.keyboard_button_2, ui_event_KeyboardButton, LV_EVENT_CLICKED, (void *)2);
+@@ -1123,7 +1743,11 @@
  void TFTView_320x240::ui_event_NodeButton(lv_event_t *e)
  {
      static bool animRunning = false;
@@ -421,7 +860,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_event_code_t event_code = lv_event_get_code(e);
      if (event_code == LV_EVENT_CLICKED && !animRunning) {
          uint32_t nodeNum = (unsigned long)e->user_data;
-@@ -1137,7 +1470,7 @@
+@@ -1137,7 +1761,7 @@
              int32_t height = lv_obj_get_height(currentPanel);
              lv_anim_init(&a);
              lv_anim_set_var(&a, currentPanel);
@@ -430,7 +869,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              lv_anim_set_duration(&a, 200);
              lv_anim_set_exec_cb(&a, ui_anim_node_panel_cb);
              lv_anim_set_path_cb(&a, lv_anim_path_linear);
-@@ -1151,7 +1484,7 @@
+@@ -1151,7 +1775,7 @@
              int32_t height = lv_obj_get_height(panel);
              lv_anim_init(&a);
              lv_anim_set_var(&a, panel);
@@ -439,7 +878,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              lv_anim_set_duration(&a, 200);
              lv_anim_set_exec_cb(&a, ui_anim_node_panel_cb);
              lv_anim_set_path_cb(&a, lv_anim_path_linear);
-@@ -1177,10 +1510,16 @@
+@@ -1177,10 +1801,16 @@
      } else if (event_code == LV_EVENT_LONG_PRESSED) {
          //  set color and text of clicked node
          uint32_t nodeNum = (unsigned long)e->user_data;
@@ -458,7 +897,19 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  void TFTView_320x240::ui_event_GroupsButton(lv_event_t *e)
-@@ -1454,10 +1793,14 @@
+@@ -1266,6 +1896,11 @@
+         }
+         lv_obj_add_flag(objects.map_osd_panel, LV_OBJ_FLAG_HIDDEN);
+     } else if (event_code == LV_EVENT_LONG_PRESSED && THIS->activeSettings == eNone) {
++        if (THIS->activePanel != objects.map_panel) {
++            // the style panel lives on the map: from another screen it opened unseen
++            THIS->ui_set_active(objects.map_button, objects.map_panel, objects.top_map_panel);
++            THIS->loadMap();
++        }
+         lv_obj_clear_flag(objects.map_osd_panel, LV_OBJ_FLAG_HIDDEN);
+         ignoreClicked = true;
+     }
+@@ -1454,10 +2089,14 @@
      lv_event_code_t event_code = lv_event_get_code(e);
      if (event_code == LV_EVENT_LONG_PRESSED && THIS->db.config.has_lora) {
          // toggle lora tx on/off
@@ -477,7 +928,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  }
  
-@@ -1537,19 +1880,24 @@
+@@ -1537,19 +2176,24 @@
          // Themes::recolorButton(objects.home_location_button, toggle);
      } else if (event_code == LV_EVENT_LONG_PRESSED && THIS->configComplete) {
          // toggle GPS not_present <-> enabled
@@ -515,7 +966,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  }
  
-@@ -1570,13 +1918,16 @@
+@@ -1570,13 +2214,16 @@
              THIS->activeSettings = eWifi;
          } else {
              // toggle WLAN on/off
@@ -539,7 +990,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          }
      }
  }
-@@ -1586,14 +1937,17 @@
+@@ -1586,14 +2233,17 @@
      lv_event_code_t event_code = lv_event_get_code(e);
      if (event_code == LV_EVENT_LONG_PRESSED && THIS->configComplete) {
          // toggle MQTT on/off
@@ -565,7 +1016,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  }
  
-@@ -1610,12 +1964,12 @@
+@@ -1610,12 +2260,12 @@
      } else if (event_code == LV_EVENT_LONG_PRESSED) {
          if (THIS->formatSD) {
              ignoreClicked = true;
@@ -580,7 +1031,80 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          }
      }
  }
-@@ -1863,9 +2217,8 @@
+@@ -1653,6 +2303,18 @@
+     std::string qr = "https://meshtastic.org/v/#" + base64Https;
+     lv_obj_remove_flag(objects.home_show_qr_panel, LV_OBJ_FLAG_HIDDEN);
+     THIS->qr = THIS->showQrCode(objects.home_show_qr_panel, qr.c_str());
++    // a little smaller and at the top: room for a line saying whose code it is and how to leave
++    const int32_t size = std::min<int32_t>(lv_obj_get_width(objects.home_show_qr_panel), lv_obj_get_height(objects.home_show_qr_panel)) - 30;
++    lv_qrcode_set_size(THIS->qr, size);
++    lv_qrcode_update(THIS->qr, qr.c_str(), qr.length());
++    lv_obj_align(THIS->qr, LV_ALIGN_TOP_MID, 0, 2);
++    homeQrCaption = lv_label_create(objects.home_show_qr_panel);
++    lv_label_set_text_fmt(homeQrCaption, "%s (%s)  -  tap to close", THIS->db.long_name, THIS->db.short_name);
++    lv_obj_align(homeQrCaption, LV_ALIGN_BOTTOM_MID, 0, -1);
++    lv_obj_set_style_text_font(homeQrCaption, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_text_color(homeQrCaption, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_remove_flag(homeQrCaption, LV_OBJ_FLAG_CLICKABLE);
++    THIS->updateTopStatus(); // the indicators and the battery would lie on top of the code
+ }
+ 
+ void TFTView_320x240::ui_event_CancelQrButton(lv_event_t *e)
+@@ -1660,6 +2322,11 @@
+     lv_obj_add_flag(objects.home_show_qr_panel, LV_OBJ_FLAG_HIDDEN);
+     lv_obj_delete(THIS->qr);
+     THIS->qr = nullptr;
++    if (homeQrCaption) {
++        lv_obj_delete(homeQrCaption);
++        homeQrCaption = nullptr;
++    }
++    THIS->updateTopStatus();
+ }
+ 
+ void TFTView_320x240::ui_event_BlankScreenButton(lv_event_t *e)
+@@ -1678,6 +2345,11 @@
+         uint32_t keyBtnIdx = (unsigned long)e->user_data;
+         switch (keyBtnIdx) {
+         case 0:
++            if (lv_textarea_get_text(objects.message_input_area)[0]) {
++                // there is text: this is the Send button (the keyboard's own tick does the same)
++                lv_obj_send_event(objects.message_input_area, LV_EVENT_READY, NULL);
++                return;
++            }
+             if (kbdSlideState == eKbdHidden) {
+                 lv_obj_remove_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
+                 THIS->showKeyboard(objects.message_input_area);
+@@ -1748,6 +2420,19 @@
+ void TFTView_320x240::ui_event_Keyboard(lv_event_t *e)
+ {
+     lv_event_code_t event_code = lv_event_get_code(e);
++    if (event_code == LV_EVENT_CANCEL) {
++        // LVGL sends this for the key with the keyboard symbol (X in the upper-case layout): close the keyboard
++        lv_obj_t *kb = lv_event_get_target_obj(e);
++        if (THIS->activePanel == objects.messages_panel && lv_keyboard_get_textarea(kb) == objects.message_input_area) {
++            if (kbdSlideState == eKbdShown)
++                THIS->hideKeyboard(objects.messages_panel);
++            else
++                THIS->resetKeyboardSlide(); // still sliding in: close at once rather than ignore the press
++        } else {
++            lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
++        }
++        return;
++    }
+     if (event_code == LV_EVENT_CLICKED) {
+         lv_obj_t *kb = lv_event_get_target_obj(e);
+         uint32_t btn_id = lv_keyboard_get_selected_button(kb);
+@@ -1759,8 +2444,7 @@
+             // lv_textarea_add_char(ta, CR_REPLACEMENT);
+             break;
+         }
+-        case 35: { // keyboard
+-            lv_keyboard_set_popovers(objects.keyboard, !lv_keyboard_get_popovers(kb));
++        case 35: { // keyboard: closes it, see LV_EVENT_CANCEL above (it used to switch the key pop-ups on and off)
+             break;
+         }
+         case 36: { // left
+@@ -1863,9 +2547,8 @@
          lv_dropdown_set_selected(objects.settings_modem_preset_dropdown, THIS->preset2val(THIS->db.config.lora.modem_preset));
  
          char buf[60];
@@ -592,7 +1116,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          lv_label_set_text(objects.frequency_slot_label, buf);
  
          uint32_t numChannels = LoRaPresets::getNumChannels(THIS->db.config.lora.region, THIS->db.config.lora.modem_preset);
-@@ -2138,6 +2491,16 @@
+@@ -2138,6 +2821,16 @@
  {
      lv_event_code_t event_code = lv_event_get_code(e);
      if (event_code == LV_EVENT_CLICKED && THIS->activeSettings == eNone) {
@@ -609,16 +1133,46 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          THIS->ui_set_active(objects.settings_button, objects.settings_about_panel, objects.top_about_panel);
      }
  }
-@@ -3047,7 +3410,7 @@
+@@ -2648,6 +3341,7 @@
+             THIS->loadMap();
+         }
+         THIS->map->setScrolledPosition(lat * 1e-7, lon * 1e-7);
++        lv_obj_add_flag(objects.map_osd_panel, LV_OBJ_FLAG_HIDDEN); // the style panel, if it was left open, hid the node
+     }
+ }
+ 
+@@ -2952,6 +3646,7 @@
+                 float lat = 1e-7 * (long)p->LV_OBJ_IDX(node_pos1_idx)->user_data;
+                 float lon = 1e-7 * (long)p->LV_OBJ_IDX(node_pos2_idx)->user_data;
+                 map->add(it.first, lat, lon, drawObjectCB);
++                map->update(it.first, lv_obj_has_flag(p, LV_OBJ_FLAG_HIDDEN)); // filtered out of the list: not on the map either
+                 lv_obj_add_flag(it.second, LV_OBJ_FLAG_CLICKABLE);
+                 lv_obj_add_event_cb(it.second, ui_event_mapNodeButton, LV_EVENT_CLICKED, (void *)it.first);
+             }
+@@ -3047,7 +3742,9 @@
  
  void TFTView_320x240::updateLocationMap(uint32_t num)
  {
 -    lv_label_set_text_fmt(objects.top_map_label, _("Locations Map (%d/%d)"), num, nodeCount);
-+    lv_label_set_text_fmt(objects.top_map_label, "Map: %d of %d nodes", (int)num, (int)nodeCount);
++    lv_label_set_text_fmt(objects.top_map_label, "Map z%d: %d of %d nodes", (int)MapTileSettings::getZoomLevel(), (int)num,
++                          (int)nodeCount);
++    updateMapScale();
  }
  
  /**
-@@ -3396,6 +3759,7 @@
+@@ -3091,6 +3788,11 @@
+ 
+         lv_obj_t *p = nodes[nodeNum];
+         lv_label_set_text_fmt(lbl, "%s", lv_label_get_text(p->LV_OBJ_IDX(node_lbs_idx)));
++        lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_color(lbl, lv_color_hex(0x202020), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_opa(lbl, 200, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_radius(lbl, 3, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_pad_hor(lbl, 2, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+ 
+         // position label callback
+         lv_obj_add_flag(p->LV_OBJ_IDX(node_pos1_idx), LV_OBJ_FLAG_CLICKABLE);
+@@ -3396,6 +4098,7 @@
      lv_event_code_t event_code = lv_event_get_code(e);
      if (event_code == LV_EVENT_CLICKED) {
          THIS->ui_set_active(objects.settings_button, objects.tools_statistics_panel, objects.top_statistics_panel);
@@ -626,7 +1180,76 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      } else if (event_code == LV_EVENT_LONG_PRESSED) {
          // clear statistics table
          THIS->updateStatistics(meshtastic_MeshPacket{.from = 0});
-@@ -3774,13 +4138,30 @@
+@@ -3474,11 +4177,9 @@
+     // get actual time
+     char timebuf[16];
+     time_t curr_time;
+-#ifdef ARCH_PORTDUINO
+-    time(&curr_time);
+-#else
+-    curr_time = actTime;
+-#endif
++    time(&curr_time); // the clock; actTime is only the last time the firmware passed on
++    if (!VALID_TIME(curr_time))
++        curr_time = actTime;
+     tm *curr_tm = localtime(&curr_time);
+     if (VALID_TIME(curr_time)) {
+         strftime(timebuf, 16, "%T", curr_tm);
+@@ -3558,6 +4259,21 @@
+         }
+     }
+ 
++    if (p.from != ownNode) {
++        // how it came: first-hand with its signal, or over how many hops; and which network
++        const size_t at = strlen(buf);
++        if (p.hop_start && p.hop_limit == p.hop_start) {
++            if (p.rx_rssi)
++                lv_snprintf(buf + at, sizeof(buf) - at, "  snr %.1f rssi %d", p.rx_snr, (int)p.rx_rssi);
++            else
++                lv_snprintf(buf + at, sizeof(buf) - at, "  snr %.1f", p.rx_snr);
++        } else if (p.hop_start) {
++            lv_snprintf(buf + at, sizeof(buf) - at, "  %d hops", (int)(p.hop_start - p.hop_limit));
++        }
++        if (nodes.find(p.from) != nodes.end() && nodes[p.from] &&
++            isMeshCoreName(lv_label_get_text(nodes[p.from]->LV_OBJ_IDX(node_lbl_idx))))
++            lv_snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "  MC");
++    }
+     if (packetCounter >= PACKET_LOGS_MAX) {
+         // delete oldest entry
+         lv_obj_del(objects.tools_packet_log_panel->spec_attr->children[0]);
+@@ -3578,6 +4294,7 @@
+                                 ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+     lv_obj_set_style_bg_opa(pLabel, 255, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+     lv_label_set_text(pLabel, buf);
++    lv_obj_set_style_text_font(pLabel, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
+ 
+     // auto-scroll if last item is visible
+     if (lv_obj_get_scroll_bottom(objects.tools_packet_log_panel) < 20)
+@@ -3622,7 +4339,7 @@
+         // clear table
+         stats.clear();
+         for (int i = 1; i < statisticTableRows; i++) {
+-            for (int j = 0; j < 7; j++) {
++            for (int j = 0; j < 8; j++) {
+                 lv_table_set_cell_value(objects.statistics_table, i, j, "");
+             }
+         }
+@@ -3716,10 +4433,12 @@
+             lv_table_set_cell_value(objects.statistics_table, row, 3, buf);
+             sprintf(buf, "%d", it2.trc);
+             lv_table_set_cell_value(objects.statistics_table, row, 4, buf);
++            sprintf(buf, "%d", it2.txt);
++            lv_table_set_cell_value(objects.statistics_table, row, 5, buf);
+             sprintf(buf, "%d", it2.nbr);
+-            lv_table_set_cell_value(objects.statistics_table, row, 5, buf);
++            lv_table_set_cell_value(objects.statistics_table, row, 6, buf);
+             sprintf(buf, "%d", it2.sum);
+-            lv_table_set_cell_value(objects.statistics_table, row, 6, buf);
++            lv_table_set_cell_value(objects.statistics_table, row, 7, buf);
+ 
+             if (row != it2.row) {
+                 it2.row = row;
+@@ -3774,13 +4493,30 @@
      time(&lastHeard);
  
      if (rssi != 0 || snr != 0.0) {
@@ -661,7 +1284,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          if (pct > 80) {
              lv_obj_set_style_bg_image_src(objects.home_signal_button, &img_home_signal_button_image,
                                            ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
-@@ -4863,10 +5244,9 @@
+@@ -4863,10 +5599,9 @@
      lv_obj_t *slider = lv_event_get_target_obj(e);
      char buf[40];
      uint32_t channel = (uint32_t)lv_slider_get_value(slider);
@@ -675,7 +1298,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_label_set_text(objects.frequency_slot_label, buf);
  }
  
-@@ -4889,8 +5269,7 @@
+@@ -4889,8 +5624,7 @@
      lv_slider_set_value(objects.frequency_slot_slider, channel, LV_ANIM_ON);
  
      char buf[40];
@@ -685,7 +1308,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_label_set_text(objects.frequency_slot_label, buf);
  }
  
-@@ -4964,8 +5343,19 @@
+@@ -4964,8 +5698,19 @@
          if (msg[i] == CR_REPLACEMENT)
              msg[i] = '\n';
  
@@ -702,12 +1325,12 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +        timestamp(when, sentAt, false);
 +        auto chat = chats.find(channelOrNode);
 +        if (chat != chats.end())
-+            setChatPreview(chat->second, when, "you", msg);
++            setChatPreview(chat->second, chat->first, when, "you", msg);
 +    }
  }
  
  /**
-@@ -4989,22 +5379,27 @@
+@@ -4989,22 +5734,30 @@
      lv_obj_set_style_pad_bottom(hiddenPanel, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
      hiddenPanel->user_data = (void *)requestId;
  
@@ -735,6 +1358,9 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      add_style_chat_message_style(textLabel);
 +    lv_obj_t *metaLabel = makeMessageMeta(hiddenPanel, textLabel, meta, true);
++    metaLabel->user_data = (void *)(unsigned long)msgTime; // when it was sent: the key its status is logged under
++    if (requestId == 0)
++        hiddenPanel->user_data = (void *)(unsigned long)msgTime; // restored: found by that time (see restoreMessage)
 +    if (status == LogMessage::eFailed)
 +        lv_obj_set_style_text_color(metaLabel, colorRed, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
 +    else if (status == LogMessage::eAcked && (unsigned long)container->user_data >= c_max_channels)
@@ -742,7 +1368,17 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      lv_obj_scroll_to_view(hiddenPanel, LV_ANIM_ON);
      lv_obj_move_foreground(objects.message_input_area);
-@@ -5170,7 +5565,7 @@
+@@ -5161,7 +5914,8 @@
+ 
+     // TODO: devices without actual time will report all nodes as lastseen = now
+     if (lastHeard) {
+-        lastHeard = std::min(curtime, (time_t)lastHeard); // adapt values too large
++        if (VALID_TIME(curtime)) // an unset clock counts seconds since the start: clamping to it wiped the stored time
++            lastHeard = std::min(curtime, (time_t)lastHeard); // adapt values too large
+ 
+         char buf[20];
+         bool isOnline = lastHeardToString(lastHeard, buf);
+@@ -5170,7 +5924,7 @@
              nodesOnline++;
          }
      } else {
@@ -751,16 +1387,16 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  
      lv_obj_set_style_text_align(ui_lastHeardLabel, LV_TEXT_ALIGN_RIGHT,
-@@ -5225,6 +5620,28 @@
+@@ -5225,6 +5979,41 @@
      lv_obj_set_style_text_align(ui_Telemetry2Label, LV_TEXT_ALIGN_RIGHT,
                                  ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
  
 +    // network tag, and the Message button: below the fold, so it shows only in the opened row
 +    makeNodeTag(p, "MeshCore", colorOrange);
 +    lv_obj_t *msgButton = lv_btn_create(p);
-+    lv_obj_set_size(msgButton, 150, 28);
-+    lv_obj_set_align(msgButton, LV_ALIGN_TOP_MID);
-+    lv_obj_set_pos(msgButton, 0, 82);
++    lv_obj_set_size(msgButton, 119, 28);
++    lv_obj_set_align(msgButton, LV_ALIGN_TOP_LEFT);
++    lv_obj_set_pos(msgButton, -2, 82);
 +    lv_obj_set_style_bg_color(msgButton, colorMesh, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
 +    lv_obj_set_style_radius(msgButton, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
 +    lv_obj_set_style_shadow_width(msgButton, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
@@ -775,12 +1411,25 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +    lv_obj_set_style_align(idLabel, LV_ALIGN_TOP_LEFT, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
 +    lv_obj_set_style_text_font(idLabel, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
 +    lv_label_set_text_fmt(idLabel, "!%08x  %s", (unsigned)nodeNum, deviceRoleToString(role));
-+    setNetworkTag(p, userLong);
++    lv_obj_t *mapButton = lv_btn_create(p);
++    lv_obj_set_size(mapButton, 119, 28);
++    lv_obj_set_align(mapButton, LV_ALIGN_TOP_RIGHT);
++    lv_obj_set_pos(mapButton, 6, 82);
++    lv_obj_set_style_bg_color(mapButton, lv_color_hex(0x436c70), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_radius(mapButton, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_set_style_shadow_width(mapButton, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_t *mapButtonLabel = lv_label_create(mapButton);
++    lv_label_set_text(mapButtonLabel, "Show on map");
++    lv_obj_center(mapButtonLabel);
++    lv_obj_set_style_text_color(mapButtonLabel, lv_color_hex(0xffffff), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    lv_obj_add_event_cb(mapButton, ui_event_positionButton, LV_EVENT_CLICKED, (void *)p);
++    lv_obj_add_flag(mapButton, LV_OBJ_FLAG_HIDDEN); // until the node has a position
++    setNetworkTag(p, userLong, (int)role);
 +
      // optimisation: hide all 6ix extended labels by default; enable only when set
      // lv_obj_add_flag(ui_lastHeardLabel, LV_OBJ_FLAG_HIDDEN); // lastHeard
      lv_obj_add_flag(ui_BatteryLabel, LV_OBJ_FLAG_HIDDEN); // Autohide battery
-@@ -5235,6 +5652,8 @@
+@@ -5235,6 +6024,8 @@
      lv_obj_add_flag(ui_Telemetry2Label, LV_OBJ_FLAG_HIDDEN);
  
      lv_obj_add_event_cb(nodeButton, ui_event_NodeButton, LV_EVENT_ALL, (void *)nodeNum);
@@ -789,18 +1438,18 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      // move node into new position within nodePanel
      if (lastHeard) {
-@@ -5322,6 +5741,10 @@
+@@ -5322,6 +6113,10 @@
          }
          lv_label_set_text(it->second->LV_OBJ_IDX(node_lbl_idx), cfg.long_name);
          it->second->LV_OBJ_IDX(node_lbl_idx)->user_data = (void *)nodeNum;
-+        setNetworkTag(it->second, cfg.long_name);
++        setNetworkTag(it->second, cfg.long_name, (int)cfg.role);
 +        if (lv_obj_get_child_count(it->second) > node_id_idx)
 +            lv_label_set_text_fmt(it->second->LV_OBJ_IDX(node_id_idx), "!%08x  %s", (unsigned)nodeNum,
 +                                  deviceRoleToString((MeshtasticView::eRole)cfg.role));
          lv_label_set_text(it->second->LV_OBJ_IDX(node_lbs_idx), cfg.short_name);
          char *userData = (char *)&(it->second->LV_OBJ_IDX(node_lbs_idx)->user_data);
          userData[0] = cfg.short_name[0];
-@@ -5365,6 +5788,10 @@
+@@ -5365,6 +6160,10 @@
  
  void TFTView_320x240::updatePosition(uint32_t nodeNum, int32_t lat, int32_t lon, int32_t alt, uint32_t sats, uint32_t precision)
  {
@@ -811,7 +1460,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      int32_t altU = abs(alt) < 10000 ? alt : 0;
      char units[3] = {};
      if (db.config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_METRIC) {
-@@ -5390,12 +5817,19 @@
+@@ -5390,12 +6189,19 @@
          lonSeconds %= 60;
          char lonLetter = (lon > 0) ? 'E' : 'W';
  
@@ -837,7 +1486,25 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
          lv_label_set_text(objects.home_location_label, buf);
  
-@@ -5477,7 +5911,7 @@
+@@ -5441,6 +6247,8 @@
+         panel->LV_OBJ_IDX(node_pos1_idx)->user_data = (void *)lat;
+         panel->LV_OBJ_IDX(node_pos2_idx)->user_data = (void *)lon;
+         lv_obj_remove_flag(panel->LV_OBJ_IDX(node_pos1_idx), LV_OBJ_FLAG_HIDDEN);
++        if (lv_obj_get_child_count(panel) > node_map_idx && lat && lon)
++            lv_obj_remove_flag(panel->LV_OBJ_IDX(node_map_idx), LV_OBJ_FLAG_HIDDEN);
+         lv_obj_remove_flag(panel->LV_OBJ_IDX(node_pos2_idx), LV_OBJ_FLAG_HIDDEN);
+     }
+ 
+@@ -5461,7 +6269,7 @@
+     buf[1] = userData[1];
+     buf[2] = userData[2];
+     buf[3] = userData[3];
+-    buf[4] = '\n';
++    buf[4] = ' '; // on the same line: the long name has the line below
+ 
+     if (db.config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_METRIC) {
+         if (dist > 1.0)
+@@ -5477,7 +6285,7 @@
      // we used the userShort label to add the distance, so re-arrange a bit the position
      lv_obj_t *userShort = nodes[nodeNum]->LV_OBJ_IDX(node_lbs_idx);
      lv_label_set_text(userShort, buf);
@@ -846,7 +1513,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  /**
-@@ -5627,9 +6061,11 @@
+@@ -5627,9 +6435,11 @@
          if (it != nodes.end()) {
              char buf[32];
              if (rssi == 0 && snr == 0.0) {
@@ -860,7 +1527,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              }
              lv_label_set_text(it->second->LV_OBJ_IDX(node_sig_idx), buf);
              it->second->LV_OBJ_IDX(node_sig_idx)->user_data = 0;
-@@ -5644,7 +6080,10 @@
+@@ -5644,7 +6454,10 @@
          auto it = nodes.find(nodeNum);
          if (it != nodes.end()) {
              char buf[32];
@@ -872,11 +1539,69 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              lv_label_set_text(it->second->LV_OBJ_IDX(node_sig_idx), buf);
              it->second->LV_OBJ_IDX(node_sig_idx)->user_data = (void *)(unsigned long)hopsAway;
              lv_obj_remove_flag(it->second->LV_OBJ_IDX(node_sig_idx), LV_OBJ_FLAG_HIDDEN);
-@@ -5753,6 +6192,96 @@
+@@ -5753,6 +6566,171 @@
          lv_obj_add_flag(objects.home_ethernet_label, LV_OBJ_FLAG_HIDDEN);
          lv_obj_add_flag(objects.home_ethernet_button, LV_OBJ_FLAG_HIDDEN);
      }
 +    updateTopStatus();
++}
++
++/**
++ * At the right end of the text field: characters used of those allowed, and how long the message will be on the air on
++ * the network this chat goes out on. While there is text the keyboard button beside the field reads Send.
++ */
++void TFTView_320x240::updateMessageCounter(void)
++{
++    if (!objects.message_input_area || !objects.keyboard_button_0)
++        return;
++    if (!messageCounter) {
++        messageCounter = lv_label_create(objects.message_input_area);
++        lv_obj_add_flag(messageCounter, lv_obj_flag_t(LV_OBJ_FLAG_FLOATING | LV_OBJ_FLAG_IGNORE_LAYOUT));
++        lv_obj_remove_flag(messageCounter, LV_OBJ_FLAG_CLICKABLE);
++        lv_obj_set_style_text_font(messageCounter, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(messageCounter, lv_color_hex(0x707070), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_align(messageCounter, LV_ALIGN_RIGHT_MID, -2, 0);
++
++        sendOverlay = lv_label_create(objects.keyboard_button_0);
++        lv_label_set_text(sendOverlay, LV_SYMBOL_OK);
++        lv_obj_add_flag(sendOverlay, lv_obj_flag_t(LV_OBJ_FLAG_FLOATING | LV_OBJ_FLAG_IGNORE_LAYOUT));
++        lv_obj_update_layout(objects.keyboard_button_0);
++        lv_obj_set_size(sendOverlay, lv_obj_get_width(objects.keyboard_button_0), lv_obj_get_height(objects.keyboard_button_0));
++        lv_obj_center(sendOverlay);
++        lv_obj_remove_flag(sendOverlay, LV_OBJ_FLAG_CLICKABLE);
++        lv_obj_set_style_text_font(sendOverlay, &lv_font_montserrat_16, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_align(sendOverlay, LV_TEXT_ALIGN_CENTER, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_pad_top(sendOverlay, 3, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(sendOverlay, lv_color_hex(0x000000), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_color(sendOverlay, lv_color_hex(0x67ea94), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_opa(sendOverlay, 255, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_radius(sendOverlay, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++    }
++    const char *text = lv_textarea_get_text(objects.message_input_area);
++    const uint32_t used = text ? strlen(text) : 0;
++    uint32_t most = lv_textarea_get_max_length(objects.message_input_area);
++    if (!most)
++        most = 200;
++    lv_obj_set_flag(sendOverlay, LV_OBJ_FLAG_HIDDEN, used == 0);
++    if (!used) {
++        lv_label_set_text(messageCounter, "");
++        return;
++    }
++    // which network this chat is on
++    bool meshcore = false;
++    if (activeMsgContainer) {
++        const uint32_t channelOrNode = (unsigned long)activeMsgContainer->user_data;
++        if (channelOrNode < c_max_channels)
++            meshcore = strcmp(db.channel[channelOrNode].settings.name, "MeshCore") == 0;
++        else if (nodes.find(channelOrNode) != nodes.end() && nodes[channelOrNode])
++            meshcore = isMeshCoreName(lv_label_get_text(nodes[channelOrNode]->LV_OBJ_IDX(node_lbl_idx)));
++    }
++    const uint32_t air = firmwareTextAirtimeMs ? firmwareTextAirtimeMs(used, meshcore) : 0;
++    if (air)
++        lv_label_set_text_fmt(messageCounter, "%u/%u  %u.%u s", (unsigned)used, (unsigned)most, (unsigned)(air / 1000),
++                              (unsigned)(air % 1000 / 100));
++    else
++        lv_label_set_text_fmt(messageCounter, "%u/%u", (unsigned)used, (unsigned)most);
 +}
 +
 +/**
@@ -893,6 +1618,18 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +    if (meshcoreUiCounters && statsMcLabel && activePanel == objects.tools_statistics_panel) {
 +        meshcoreUiCounters(text, sizeof(text), 1);
 +        lv_label_set_text(statsMcLabel, text);
++    }
++    if (firmwareGpsPosition) {
++        static int32_t shownLat = 0, shownLon = 0;
++        int32_t lat = 0, lon = 0, alt = 0;
++        if (firmwareGpsPosition(&lat, &lon, &alt) && (lat != shownLat || lon != shownLon || !hasPosition)) {
++            shownLat = lat;
++            shownLon = lon;
++            uint32_t seen = ownSats;
++            if (firmwareGpsStatus)
++                firmwareGpsStatus(&seen);
++            updatePosition(ownNode, lat, lon, alt, seen, 32); // home cell, distances to the nodes, the map's own place
++        }
 +    }
 +    if (!hasPosition && firmwareGpsStatus) {
 +        uint32_t seen = 0;
@@ -966,36 +1703,31 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +    const int32_t percentWidth =
 +        percent && percent[0] > ' ' ? lv_text_get_width(percent, strlen(percent), &ui_font_montserrat_12, 0) + 4 : 0;
 +    lv_obj_align(label, LV_ALIGN_TOP_RIGHT, -(27 + percentWidth), 1);
++
++    // not over the QR code while that is up
++    const bool codeShown = objects.home_show_qr_panel && !lv_obj_has_flag(objects.home_show_qr_panel, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_set_flag(label, LV_OBJ_FLAG_HIDDEN, codeShown);
++    lv_obj_set_flag(objects.battery_panel, LV_OBJ_FLAG_HIDDEN, codeShown);
  }
  
  // ResponseHandler callbacks
-@@ -6273,6 +6802,25 @@
+@@ -6273,6 +7251,15 @@
                                            : ack ? colorBlueGreen
                                                  : colorYellow,
                                            ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
-+            // and say it in words: the small line reads "<date time>  <status>"
-+            if (lv_obj_get_child_count(panel) > 1) {
-+                lv_obj_t *metaLabel = panel->spec_attr->children[1];
-+                char meta[48];
-+                lv_snprintf(meta, sizeof(meta), "%s", lv_label_get_text(metaLabel));
-+                char *sep = strstr(meta, "  ");
-+                char *at = sep ? sep + 2 : (meta[0] >= '0' && meta[0] <= '9') ? meta + strlen(meta) : meta;
-+                if (!sep && at != meta && sizeof(meta) - (at - meta) > 3) {
-+                    strcpy(at, "  ");
-+                    at += 2;
-+                }
-+                lv_snprintf(at, sizeof(meta) - (at - meta), "%s",
-+                            sentStatusWord(err ? LogMessage::eFailed : ack ? LogMessage::eAcked : LogMessage::eHeard,
-+                                           channelOrNode < c_max_channels));
-+                lv_label_set_text(metaLabel, meta);
-+                lv_obj_set_style_text_color(metaLabel,
-+                                            err ? colorRed : ack && channelOrNode >= c_max_channels ? colorMesh : lv_color_hex(0xa0a0a0),
-+                                            ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++            // and say it in words, and keep it: after a restart the message is shown with this status again
++            const LogMessage::MsgStatus status = err ? LogMessage::eFailed : ack ? LogMessage::eAcked : LogMessage::eHeard;
++            const bool toChannel = channelOrNode < c_max_channels;
++            if (applySentStatus(panel, status, toChannel) && lv_obj_get_child_count(panel) > 1) {
++                const uint32_t sentAt = (uint32_t)(unsigned long)lv_obj_get_child(panel, 1)->user_data;
++                if (VALID_TIME(sentAt))
++                    controller->logMessageStatus(toChannel ? UINT32_MAX : channelOrNode, toChannel ? (uint8_t)channelOrNode : 0,
++                                                 sentAt, status);
 +            }
  
              // store message
              break;
-@@ -6295,6 +6843,7 @@
+@@ -6295,6 +7282,7 @@
          writePacketLog(p);
      }
      if (p.from != ownNode) {
@@ -1003,7 +1735,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          updateSignalStrength(p.rx_rssi, p.rx_snr);
      }
      updateStatistics(p);
-@@ -6408,6 +6957,7 @@
+@@ -6408,6 +7396,7 @@
      if (ch.role != meshtastic_Channel_Role_DISABLED) {
          setChannelName(ch);
  
@@ -1011,7 +1743,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          lv_obj_set_width(btn[ch.index], lv_pct(80));
          lv_obj_set_style_pad_left(btn[ch.index], 8, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
  
-@@ -6458,6 +7008,7 @@
+@@ -6458,6 +7447,7 @@
          lv_snprintf(buf, sizeof(buf), "%d", ch.index);
          lv_label_set_text(channel[ch.index], buf);
          lv_obj_set_width(btn[ch.index], lv_pct(30));
@@ -1019,7 +1751,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
          if (lv_obj_get_child_cnt(btn[ch.index]) == 2) {
              lv_obj_delete(lv_obj_get_child(btn[ch.index], 1));
-@@ -6585,7 +7136,15 @@
+@@ -6585,7 +7575,15 @@
          strcpy(loraFreq, _("region unset"));
      } else if (cfg.use_preset) {
          float frequency = LoRaPresets::getRadioFreq(cfg.region, cfg.modem_preset, cfg.channel_num) + cfg.frequency_offset;
@@ -1036,7 +1768,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          lv_obj_remove_state(objects.basic_settings_modem_preset_button, LV_STATE_DISABLED);
      } else {
          float frequency = cfg.override_frequency + cfg.frequency_offset;
-@@ -6821,23 +7380,27 @@
+@@ -6821,23 +7819,27 @@
  uint32_t TFTView_320x240::timestamp(char *buf, uint32_t datetime, bool update)
  {
      time_t local = datetime;
@@ -1075,7 +1807,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  /**
-@@ -6991,9 +7554,9 @@
+@@ -6991,9 +7993,9 @@
      lv_obj_set_scroll_dir(container, LV_DIR_VER);
      lv_obj_set_style_pad_left(container, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
      lv_obj_set_style_pad_right(container, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
@@ -1087,7 +1819,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_obj_set_style_pad_column(container, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
  
      // store new message container
-@@ -7023,8 +7586,14 @@
+@@ -7023,8 +8025,14 @@
  void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const char *msg, uint32_t &msgTime, bool restore)
  {
      ILOG_DEBUG("newMessage: from:0x%08x, to:0x%08x, ch:%d, time:%d", from, to, ch, msgTime);
@@ -1103,7 +1835,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_obj_t *container = nullptr;
      if (to == UINT32_MAX) { // message for group, prepend short name to msg
          if (nodes.find(from) == nodes.end()) {
-@@ -7038,6 +7607,7 @@
+@@ -7038,6 +8046,7 @@
              }
          }
          buf[pos++] = ' ';
@@ -1111,7 +1843,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          container = channelGroup[ch];
      } else { // message for us
          container = messages[from];
-@@ -7049,10 +7619,25 @@
+@@ -7049,10 +8058,25 @@
      }
  
      pos += timestamp(&buf[pos], msgTime, !restore);
@@ -1134,12 +1866,12 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +            lv_snprintf(who, sizeof(who), "%s", lv_label_get_text(nodes[from]->LV_OBJ_IDX(node_lbs_idx)));
 +        auto chat = chats.find(to == UINT32_MAX ? (uint32_t)ch : from);
 +        if (chat != chats.end())
-+            setChatPreview(chat->second, when, who, msg);
++            setChatPreview(chat->second, chat->first, when, who, msg);
 +    }
  
      if (!restore) {
          // display msg popup if not already viewing the messages
-@@ -7081,7 +7666,7 @@
+@@ -7081,7 +8105,7 @@
   * @param ch
   * @param msg
   */
@@ -1148,7 +1880,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  {
      lv_obj_t *hiddenPanel = lv_obj_create(container);
      lv_obj_set_width(hiddenPanel, lv_pct(100));
-@@ -7105,6 +7690,8 @@
+@@ -7105,6 +8129,8 @@
      add_style_new_message_style(msgLabel);
      lv_obj_add_flag(msgLabel, LV_OBJ_FLAG_CLICK_FOCUSABLE);
      lv_obj_add_event_cb(msgLabel, ui_event_chatNodeButton, LV_EVENT_CLICKED, (void *)nodeNum);
@@ -1157,17 +1889,37 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      if (state == MeshtasticView::eRunning) {
          lv_obj_scroll_to_view(hiddenPanel, LV_ANIM_ON);
-@@ -7120,6 +7707,9 @@
+@@ -7120,6 +8146,29 @@
      //((uint8_t *)msg.bytes)[msg._size] = 0;
      // ILOG_DEBUG("restoring msg from:0x%08x, to:0x%08x, ch:%d, time:%d, status:%d, trash:%d, size:%d, '%s'", msg.from, msg.to,
      //           msg.ch, msg.time, (int)msg.status, msg.trashFlag, msg._size, msg.bytes);
 +
 +    if (msg.from == ownNode && msg.to == ownNode)
 +        return; // a notice the firmware once showed, not a chat
++
++    if (msg.from == ownNode && msg.length() == 0 && !msg.trashFlag &&
++        (msg.status == LogMessage::eHeard || msg.status == LogMessage::eAcked || msg.status == LogMessage::eFailed)) {
++        // not a message: what became of the one we sent at msg.time (written by handleTextMessageResponse)
++        lv_obj_t *container = nullptr;
++        if (msg.to == UINT32_MAX)
++            container = msg.ch < c_max_channels ? channelGroup[msg.ch] : nullptr;
++        else if (messages.find(msg.to) != messages.end())
++            container = messages[msg.to];
++        if (container) {
++            for (uint32_t i = lv_obj_get_child_count(container); i-- > 0;) {
++                lv_obj_t *row = lv_obj_get_child(container, i);
++                if ((unsigned long)row->user_data == (unsigned long)msg.time) {
++                    applySentStatus(row, msg.status, msg.to == UINT32_MAX);
++                    break;
++                }
++            }
++        }
++        return;
++    }
  
      if (msg.from == ownNode) {
          lv_obj_t *container = nullptr;
-@@ -7149,6 +7739,11 @@
+@@ -7149,6 +8198,11 @@
              if (container != activeMsgContainer)
                  lv_obj_add_flag(container, LV_OBJ_FLAG_HIDDEN);
              addMessage(container, msg.time, 0, (char *)msg.bytes, msg.status);
@@ -1175,11 +1927,11 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +            timestamp(when, msg.time, false);
 +            auto chat = chats.find(msg.to == UINT32_MAX ? (uint32_t)msg.ch : msg.to);
 +            if (chat != chats.end())
-+                setChatPreview(chat->second, when, "you", (const char *)msg.bytes);
++                setChatPreview(chat->second, chat->first, when, "you", (const char *)msg.bytes);
          }
      } else if (nodes.find(msg.from) != nodes.end()) {
          if (msg.trashFlag && chats.find(msg.from) != chats.end()) {
-@@ -7161,22 +7756,25 @@
+@@ -7161,22 +8215,25 @@
          }
      } else {
          int pos = 0;
@@ -1212,7 +1964,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  }
  
-@@ -7200,7 +7798,7 @@
+@@ -7200,7 +8257,7 @@
      // ChatsButton
      lv_obj_t *chatBtn = lv_btn_create(parent_obj);
      lv_obj_set_pos(chatBtn, 0, 0);
@@ -1221,7 +1973,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_obj_add_flag(chatBtn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
      lv_obj_clear_flag(chatBtn, LV_OBJ_FLAG_SCROLLABLE);
      add_style_home_button_style(chatBtn);
-@@ -7243,8 +7841,10 @@
+@@ -7243,8 +8300,10 @@
              lv_obj_set_size(obj, LV_PCT(100), LV_SIZE_CONTENT);
              lv_label_set_long_mode(obj, LV_LABEL_LONG_DOT);
              lv_label_set_text(obj, buf);
@@ -1233,7 +1985,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_LEFT,
                                          ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
          }
-@@ -7275,6 +7875,18 @@
+@@ -7275,6 +8334,32 @@
          }
      }
  
@@ -1247,12 +1999,80 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +        lv_obj_set_pos(preview, 0, -1);
 +        lv_obj_set_style_text_font(preview, &lv_font_montserrat_10, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
 +        lv_obj_set_style_text_color(preview, lv_color_hex(0xa0a0a0), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++
++        // unread messages (fourth child: see setChatUnread)
++        lv_obj_t *badge = lv_label_create(chatBtn);
++        lv_label_set_text(badge, "");
++        lv_obj_set_align(badge, LV_ALIGN_RIGHT_MID);
++        lv_obj_set_pos(badge, -6, 0);
++        lv_obj_set_style_text_font(badge, &ui_font_montserrat_12, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_text_color(badge, lv_color_hex(0x000000), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_color(badge, lv_color_hex(0xff8c04), ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_bg_opa(badge, 255, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_radius(badge, 8, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_pad_hor(badge, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_set_style_pad_ver(badge, 1, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
 +    }
 +
      chats[index] = chatBtn;
      updateActiveChats();
      if (index > c_max_channels) {
-@@ -7708,12 +8320,23 @@
+@@ -7294,6 +8379,7 @@
+         // mark chat in color
+         lv_obj_set_style_border_color(it->second, colorOrange,
+                                       ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
++        setChatUnread(it->second, true);
+     }
+ }
+ 
+@@ -7366,6 +8452,11 @@
+         return;
+     }
+ 
++    {
++        auto chat = chats.find(ch); // read now, however it was opened
++        if (chat != chats.end())
++            setChatUnread(chat->second, false);
++    }
+     lv_obj_add_flag(activeMsgContainer, LV_OBJ_FLAG_HIDDEN);
+     activeMsgContainer = channelGroup[ch];
+     if (!activeMsgContainer) {
+@@ -7385,6 +8476,11 @@
+  */
+ void TFTView_320x240::showMessages(uint32_t nodeNum)
+ {
++    {
++        auto chat = chats.find(nodeNum);
++        if (chat != chats.end())
++            setChatUnread(chat->second, false);
++    }
+     lv_obj_add_flag(activeMsgContainer, LV_OBJ_FLAG_HIDDEN);
+     activeMsgContainer = messages[nodeNum];
+     if (!activeMsgContainer) {
+@@ -7531,8 +8627,8 @@
+ 
+ lv_obj_t *TFTView_320x240::showQrCode(lv_obj_t *parent, const char *data)
+ {
+-    lv_color_t bg_color = colorMesh;
+-    lv_color_t fg_color = lv_palette_darken(LV_PALETTE_BLUE, 4);
++    lv_color_t bg_color = lv_color_hex(0xffffff); // black on white reads best, off this screen and off a photo of it
++    lv_color_t fg_color = lv_color_hex(0x000000);
+     qr = lv_qrcode_create(parent);
+     int32_t size = std::min<int32_t>(lv_obj_get_width(parent), lv_obj_get_height(parent)) - 8;
+     lv_qrcode_set_size(qr, size);
+@@ -7540,8 +8636,8 @@
+     lv_qrcode_set_light_color(qr, bg_color);
+     lv_qrcode_update(qr, data, strlen(data));
+     lv_obj_center(qr);
+-    lv_obj_set_style_border_color(qr, fg_color, 0);
+-    lv_obj_set_style_border_width(qr, 4, 0);
++    lv_obj_set_style_border_color(qr, bg_color, 0); // the quiet zone a reader needs around the code
++    lv_obj_set_style_border_width(qr, 6, 0);
+     return qr;
+ }
+ 
+@@ -7708,12 +8804,35 @@
  
  void TFTView_320x240::updateNodesStatus(void)
  {
@@ -1266,20 +2086,33 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
 +            continue;
 +        if ((long)it.second->LV_OBJ_IDX(node_sig_idx)->user_data == 0)
 +            direct++;
-+        if (!lv_obj_has_flag(it.second->LV_OBJ_IDX(node_tag_idx), LV_OBJ_FLAG_HIDDEN))
++        if (isMeshCoreName(lv_label_get_text(it.second->LV_OBJ_IDX(node_lbl_idx)))) // the tag also names roles now
 +            meshcore++;
 +    }
 +    lv_snprintf(buf, sizeof(buf), "%d of %d online\n%d direct, %d MC", (int)nodesOnline, (int)nodeCount, direct, meshcore);
      lv_label_set_text(objects.home_nodes_label, buf);
  
-+    lv_snprintf(buf, sizeof(buf), "%d of %d online", (int)nodesOnline, (int)nodeCount);
-     if (nodesFiltered)
+-    if (nodesFiltered)
 -        lv_snprintf(buf, sizeof(buf), _("Filter: %d of %d nodes"), nodeCount - nodesFiltered, nodeCount);
-+        lv_snprintf(buf, sizeof(buf), "%d/%d shown, %d online", (int)(nodeCount - nodesFiltered), (int)nodeCount, (int)nodesOnline);
++    lv_snprintf(buf, sizeof(buf), "%d of %d online", (int)nodesOnline, (int)nodeCount);
++    if (nodesFiltered) {
++        // what hides the others, shortest first; a tap on the title clears it all
++        char why[32] = "";
++        char hops[8] = "";
++        if (lv_dropdown_get_selected(objects.nodes_filter_hops_dropdown))
++            lv_dropdown_get_selected_str(objects.nodes_filter_hops_dropdown, hops, sizeof(hops));
++        lv_snprintf(why, sizeof(why), "%s%s%s%s%s%s%s", hops[0] ? "hops " : "", hops,
++                    lv_obj_has_state(objects.nodes_filter_offline_switch, LV_STATE_CHECKED) ? " online" : "",
++                    lv_obj_has_state(objects.nodes_filter_unknown_switch, LV_STATE_CHECKED) ? " known" : "",
++                    lv_obj_has_state(objects.nodes_filter_public_key_switch, LV_STATE_CHECKED) ? " key" : "",
++                    lv_obj_has_state(objects.nodes_filter_position_switch, LV_STATE_CHECKED) ? " pos" : "",
++                    lv_textarea_get_text(objects.nodes_filter_name_area)[0] ? " name" : "");
++        lv_snprintf(buf, sizeof(buf), "%d/%d: %s  [x]", (int)(nodeCount - nodesFiltered), (int)nodeCount, why[0] == ' ' ? why + 1 : why);
++    }
      lv_label_set_text(objects.top_nodes_online_label, buf);
  }
  
-@@ -7817,6 +8440,7 @@
+@@ -7817,6 +8936,7 @@
                                      ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
      }
      lv_label_set_text(objects.home_mail_label, buf);
@@ -1287,7 +2120,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  /**
-@@ -8083,7 +8707,8 @@
+@@ -8083,7 +9203,8 @@
  #ifdef ARDUINO_ARCH_ESP32
          freeHeap = ESP.getFreeHeap();
          freeHeap_pct = 100 * freeHeap / ESP.getHeapSize();
@@ -1297,7 +2130,31 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  #elif defined(ARCH_PORTDUINO)
          static uint32_t totalMem = LinuxHelper::getTotalMem();
          if (totalMem != 0) {
-@@ -8139,9 +8764,14 @@
+@@ -8100,7 +9221,22 @@
+ 
+ void TFTView_320x240::task_handler(void)
+ {
+-    MeshtasticView::task_handler();
++    const time_t clockBefore = curtime;
++    MeshtasticView::task_handler(); // reads the clock into curtime
++    if (clockBefore > 0 && !VALID_TIME(clockBefore) && VALID_TIME(curtime)) {
++        // the clock was just set: what was stamped in seconds since the start becomes wall time
++        const time_t shift = curtime - clockBefore;
++        for (auto &it : nodes) {
++            if (!it.second)
++                continue;
++            lv_obj_t *stamp = it.second->LV_OBJ_IDX(node_lh_idx);
++            const time_t heard = (time_t)stamp->user_data;
++            if (heard > 0 && !VALID_TIME(heard))
++                stamp->user_data = (void *)(heard + shift);
++        }
++        if (lastHeard > 0 && !VALID_TIME(lastHeard))
++            lastHeard += shift;
++    }
+ 
+     if (screensInitialised) {
+         if (map && activePanel == objects.map_panel)
+@@ -8139,9 +9275,14 @@
                  lastrun10 = curtime;
                  updateFreeMem();
  

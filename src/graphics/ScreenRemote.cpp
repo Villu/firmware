@@ -30,10 +30,12 @@ void mirrorFlush(lv_display_t *disp, const lv_area_t *area, uint8_t *px)
 volatile int16_t touchX = 0, touchY = 0;
 volatile bool touchDown = false;
 volatile uint32_t wakeCount = 0;
+volatile uint32_t readCount = 0; // how often LVGL has looked at the finger
 
 void readRemote(lv_indev_t *indev, lv_indev_data_t *data)
 {
     static uint32_t wakeSeen = 0;
+    readCount++;
     const bool down = touchDown;
     if (down || wakeSeen != wakeCount) {
         wakeSeen = wakeCount;
@@ -42,6 +44,27 @@ void readRemote(lv_indev_t *indev, lv_indev_data_t *data)
     data->point.x = touchX;
     data->point.y = touchY;
     data->state = down ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
+// Wait until LVGL has looked at the finger this many more times. A press is timed from when LVGL saw it, not from
+// when it was set here: while the UI is busy (map tiles) it looks late, and a 700 ms press ended up a short click.
+void awaitReads(uint32_t count, uint32_t limitMs)
+{
+    const uint32_t from = readCount, start = millis();
+    while (readCount - from < count && millis() - start < limitMs)
+        delay(5);
+}
+
+// A sleeping screen is one black cover over everything (and nothing else on the screen is ever all black)
+bool looksAsleep()
+{
+    if (!mirror)
+        return false;
+    const size_t bytes = (size_t)mirrorW * mirrorH * 2;
+    for (size_t i = 0; i < bytes; i += 2 * 53)
+        if (mirror[i] || mirror[i + 1])
+            return false;
+    return true;
 }
 
 bool sendAll(int client, const void *data, size_t len)
@@ -79,11 +102,13 @@ void serve(int client)
         touchX = a;
         touchY = b;
         wakeCount++;
-        delay(80);
+        awaitReads(2, 500); // the place seen, finger up
         touchDown = true;
+        awaitReads(2, 3000); // the press seen: the hold counts from here
         delay(ms > 0 ? ms : 120);
+        awaitReads(2, 3000); // looked at once more while down, so a long press that is due is sent
         touchDown = false;
-        delay(80);
+        awaitReads(2, 500);
         sendAll(client, "ok\n", 3);
     } else if (sscanf(line, "drag %d %d %d %d %d", &a, &b, &c, &d, &ms) >= 4) {
         const int steps = (ms > 0 ? ms : 400) / 20 + 1;
@@ -103,7 +128,20 @@ void serve(int client)
         delay(80);
         sendAll(client, "ok\n", 3);
     } else if (strncmp(line, "wake", 4) == 0) {
+        // Awake: counting as activity keeps it on. Asleep: only a press on the black cover wakes it, and there a
+        // press does nothing else. So this never presses anything on a screen that is on.
         wakeCount++;
+        if (looksAsleep()) {
+            touchX = mirrorW / 2;
+            touchY = mirrorH / 2;
+            awaitReads(2, 500);
+            touchDown = true;
+            awaitReads(3, 3000);
+            delay(120);
+            touchDown = false;
+            awaitReads(2, 500);
+            delay(700); // the screen comes back and redraws
+        }
         sendAll(client, "ok\n", 3);
     } else {
         sendAll(client, "?\n", 2);
