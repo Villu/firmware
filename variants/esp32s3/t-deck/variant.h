@@ -55,6 +55,9 @@
 // ratio of voltage divider = 2.0 (RD2=100k, RD3=100k)
 #define ADC_MULTIPLIER 2.11 // 2.0 + 10% for correction of display undervoltage.
 #define ADC_CHANNEL ADC_CHANNEL_3
+// No USB-power pin: external power is told from the reading. With the multiplier above a full battery alone reads up to
+// ~4.43 V (so the default 4.20 V limit showed "charging" on battery); on USB it reads ~5.0 V.
+#define EXT_POWER_MIN_MV 4600
 
 // keyboard
 #define I2C_SDA 18 // I2C pins for this board

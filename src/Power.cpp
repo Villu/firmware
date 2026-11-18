@@ -606,7 +606,13 @@ class AnalogBatteryLevel : public HasBatteryLevel
         // EXT_PWR_DETECT pin.
         return HWCDC::isPlugged();
 #endif
+#ifdef EXT_POWER_MIN_MV
+        // A board whose battery reading runs high (a correction factor in ADC_MULTIPLIER): a full battery alone would
+        // pass chargingVolt and show "charging" on battery. It names the level only external power reaches.
+        return getBattVoltage() > EXT_POWER_MIN_MV;
+#else
         return getBattVoltage() > chargingVolt;
+#endif
     }
 
     /// Assume charging if we have a battery and external power is connected.
