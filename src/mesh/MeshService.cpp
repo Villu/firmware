@@ -9,6 +9,7 @@
 #include "MeshService.h"
 #if MESHCORE_COEXIST
 #include "modules/MeshCoreModule.h"
+#include "modules/NewNodeAlert.h"
 #endif
 #include "MessageStore.h"
 #include "NodeDB.h"
@@ -95,6 +96,10 @@ int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
     powerFSM.trigger(EVENT_PACKET_FOR_PHONE); // Possibly keep the node from sleeping
 
     nodeDB->updateFrom(*mp); // update our DB state based off sniffing every RX packet from the radio
+#if MESHCORE_COEXIST
+    if (!isFromUs(mp)) // how a node new to the database was first heard: directly or not (it may alert)
+        NewNodeAlert::heard(mp->from, getHopsAway(*mp), mp->via_mqtt, mp->rx_snr);
+#endif
     bool isPreferredRebroadcaster =
         IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER, meshtastic_Config_DeviceConfig_Role_ROUTER_LATE,
                   meshtastic_Config_DeviceConfig_Role_CLIENT_BASE);

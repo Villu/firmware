@@ -32,6 +32,9 @@
 #include "mesh/generated/meshtastic/deviceonly_legacy.pb.h"
 #include "meshUtils.h"
 #include "modules/NeighborInfoModule.h"
+#if MESHCORE_COEXIST
+#include "modules/NewNodeAlert.h"
+#endif
 #if !MESHTASTIC_EXCLUDE_BEACON
 #include "modules/MeshBeaconModule.h"
 #endif
@@ -4744,10 +4747,16 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
         // everything is missing except the nodenum
         memset(lite, 0, sizeof(*lite));
         lite->num = n;
+#if MESHCORE_COEXIST
+        bool rehydrated = false; // back from the warm tier: known before, not new
+#endif
 #if WARM_NODE_COUNT > 0
         // Re-admission: restore what the warm tier kept for this node
         WarmNodeEntry warm;
         if (warmStore.take(n, warm)) {
+#if MESHCORE_COEXIST
+            rehydrated = true;
+#endif
             lite->last_heard = warmTimeOf(warm); // mask off the stolen metadata bits
             // Restore the role the warm tier cached, so re-admission isn't stuck at CLIENT
             // until the next NodeInfo arrives.
@@ -4782,6 +4791,10 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
         }
 #endif
         LOG_INFO("Add node to database: %i nodes, %u bytes free", numMeshNodes, memGet.getFreeHeap());
+#if MESHCORE_COEXIST
+        if (!rehydrated)
+            NewNodeAlert::created(n); // a node never seen before: it may alert (directly heard or a router)
+#endif
     }
 
     return lite;

@@ -5,6 +5,7 @@
 #include "FSCommon.h"
 #include "GPSStatus.h"
 #include "MeshService.h"
+#include "NewNodeAlert.h"
 #include "NodeDB.h"
 #include "PowerStatus.h"
 #include "SPILock.h"
@@ -163,12 +164,15 @@ NodeNum touchNode(const char *name, uint8_t hops, bool always = false, bool tell
     user.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
     const int ch = mcChannelIndex();
-    const bool changed = nodeDB->updateUser(num, user, ch < 0 ? 0 : (uint8_t)ch);
-    if (meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(num)) {
+    // When it was heard goes in before updateUser: that saves the node database at once for a new node, and a time
+    // set afterwards lived only in memory, so after a reset (a flash, power lost) the node came back "never" heard.
+    if (meshtastic_NodeInfoLite *node = nodeDB->getOrCreateMeshNode(num)) {
         node->last_heard = getValidTime(RTCQualityFromNet);
         node->has_hops_away = true;
         node->hops_away = hops;
     }
+    const bool changed = nodeDB->updateUser(num, user, ch < 0 ? 0 : (uint8_t)ch);
+    NewNodeAlert::heardMeshCore(num, hops); // counts only if the node database has just made it
     if (changed || tell) {
         if (meshtastic_MeshPacket *p = packetPool.allocZeroed()) {
             p->from = num;
