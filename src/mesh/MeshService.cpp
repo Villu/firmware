@@ -378,8 +378,10 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p, bool fromScreen)
 #if SCREEN_HAS_OWN_QUEUE
     // The screen's signal scanner asks one direct neighbour with hop limit 0 and wants an ACK. The router reads hop limit 0
     // with want_ack from an app as "no preference" and raises it to the default, so the ask could be relayed across the
-    // mesh; sent as a local packet it stays at zero hops. Phone apps keep the stock meaning.
-    if (a && fromScreen && a->want_ack && a->hop_limit == 0 && !isBroadcast(a->to)) {
+    // mesh; sent as a local packet it stays at zero hops. Phone apps keep the stock meaning. Never for packets to this node:
+    // the screen's admin requests (settings, connection status) go there with hop limit 0 too, and a local packet is not
+    // handed to the admin module.
+    if (a && fromScreen && a->want_ack && a->hop_limit == 0 && !isBroadcast(a->to) && !isToUs(a)) {
         sendToMesh(a, RX_SRC_LOCAL);
         return;
     }
