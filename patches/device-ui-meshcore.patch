@@ -1981,7 +1981,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      } else if (event_code == LV_EVENT_LONG_PRESSED) {
          // clear statistics table
          THIS->updateStatistics(meshtastic_MeshPacket{.from = 0});
-@@ -3416,45 +4630,30 @@
+@@ -3416,56 +4630,54 @@
  
  void TFTView_320x240::packetDetected(const meshtastic_MeshPacket &p)
  {
@@ -2051,7 +2051,38 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  void TFTView_320x240::writePacketLog(const meshtastic_MeshPacket &p)
-@@ -3474,11 +4673,9 @@
+ {
+-    static std::unordered_map<uint16_t, const char *> name = {
+-        {0, "unknown"},        {1, "text message"},    {2, "remote hardware"}, {3, "position"},    {4, "node info"},
+-        {5, "routing"},        {6, "admin"},           {7, "text message"},    {8, "waypoint"},    {9, "audio"},
+-        {10, "sensor"},        {32, "reply"},          {33, "ip tunnel"},      {34, "paxcounter"}, {64, "serial"},
+-        {65, "store forward"}, {66, "range test"},     {67, "telemetry"},      {68, "ZPS"},        {69, "simulator"},
+-        {70, "tracert"},       {71, "neighbor info"},  {72, "atax"},           {73, "map report"}, {74, "power stress"},
+-        {256, "private"},      {257, "atax forwarder"}};
++    static const std::unordered_map<uint16_t, const char *> names = {
++        {0, "unknown"},        {1, "text message"},    {2, "remote hardware"}, {3, "position"},     {4, "node info"},
++        {5, "routing"},        {6, "admin"},           {7, "text message"},    {8, "waypoint"},     {9, "audio"},
++        {10, "sensor"},        {11, "alert"},          {12, "key verify"},     {13, "remote shell"}, {32, "reply"},
++        {33, "ip tunnel"},     {34, "paxcounter"},     {35, "store fwd++"},    {36, "node status"}, {37, "mesh beacon"},
++        {38, "paging"},        {64, "serial"},         {65, "store forward"},  {66, "range test"},  {67, "telemetry"},
++        {68, "ZPS"},           {69, "simulator"},      {70, "tracert"},        {71, "neighbor info"}, {72, "atak"},
++        {73, "map report"},    {74, "power stress"},   {75, "lorawan bridge"}, {76, "reticulum"},   {77, "cayenne"},
++        {78, "atak v2"},       {79, "lora ota"},       {112, "group alarm"},   {256, "private"},    {257, "atak forwarder"}};
++    // a port the table does not know (a newer firmware's) is shown by number: looking it up with [] gave a null name,
++    // and printing that crashed the device
++    char portBuf[12];
++    const char *portName;
++    const auto known = names.find(p.decoded.portnum);
++    if (known != names.end()) {
++        portName = known->second;
++    } else {
++        snprintf(portBuf, sizeof(portBuf), "port %u", (unsigned)p.decoded.portnum);
++        portName = portBuf;
++    }
+ 
+     // ignore admin packages initiated by us
+     if (p.from == ownNode && p.decoded.portnum == meshtastic_PortNum_ADMIN_APP)
+@@ -3474,11 +4686,9 @@
      // get actual time
      char timebuf[16];
      time_t curr_time;
@@ -2066,7 +2097,34 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      tm *curr_tm = localtime(&curr_time);
      if (VALID_TIME(curr_time)) {
          strftime(timebuf, 16, "%T", curr_tm);
-@@ -3558,6 +4755,21 @@
+@@ -3488,7 +4698,10 @@
+ 
+     // get node name from
+     char from[5];
+-    char *userShort = (char *)&(nodes[p.from]->LV_OBJ_IDX(node_lbs_idx)->user_data);
++    const auto sender = nodes.find(p.from);
++    const char *userShort = sender != nodes.end() && sender->second
++                                ? (const char *)&(sender->second->LV_OBJ_IDX(node_lbs_idx)->user_data)
++                                : "?";
+     int pos = 0;
+     while (pos < 4 && userShort[pos] != 0) {
+         from[pos] = userShort[pos];
+@@ -3498,11 +4711,10 @@
+ 
+     char buf[256];
+     if (p.to == 0xffffffff)
+-        sprintf(buf, "%s: ch%d %s:%04x->all: %s", timebuf, p.channel, from, p.from & 0xffff,
+-                name[p.decoded.portnum]); // note: this may crash if there's a new portnum not in this map...
++        snprintf(buf, sizeof(buf), "%s: ch%d %s:%04x->all: %s", timebuf, p.channel, from, p.from & 0xffff, portName);
+     else
+-        sprintf(buf, "%s: ch%d %s:%04x->%s%04x: %s", timebuf, p.channel, from, p.from & 0xffff, p.to == ownNode ? "*" : "",
+-                p.to & 0xffff, name[p.decoded.portnum]);
++        snprintf(buf, sizeof(buf), "%s: ch%d %s:%04x->%s%04x: %s", timebuf, p.channel, from, p.from & 0xffff,
++                 p.to == ownNode ? "*" : "", p.to & 0xffff, portName);
+ 
+     if (p.decoded.portnum == meshtastic_PortNum_TELEMETRY_APP) {
+         meshtastic_Telemetry telemetry;
+@@ -3558,6 +4770,21 @@
          }
      }
  
@@ -2088,7 +2146,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      if (packetCounter >= PACKET_LOGS_MAX) {
          // delete oldest entry
          lv_obj_del(objects.tools_packet_log_panel->spec_attr->children[0]);
-@@ -3578,6 +4790,7 @@
+@@ -3578,6 +4805,7 @@
                                  ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
      lv_obj_set_style_bg_opa(pLabel, 255, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
      lv_label_set_text(pLabel, buf);
@@ -2096,7 +2154,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      // auto-scroll if last item is visible
      if (lv_obj_get_scroll_bottom(objects.tools_packet_log_panel) < 20)
-@@ -3622,7 +4835,7 @@
+@@ -3622,7 +4850,7 @@
          // clear table
          stats.clear();
          for (int i = 1; i < statisticTableRows; i++) {
@@ -2105,7 +2163,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
                  lv_table_set_cell_value(objects.statistics_table, i, j, "");
              }
          }
-@@ -3687,13 +4900,13 @@
+@@ -3687,13 +4915,13 @@
  
      stats.sort();
  
@@ -2124,7 +2182,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              buf[0] = '\0';
              auto it = nodes.find(it2.id); // node may have been removed from nodes, so check if still there
              if (it != nodes.end() && it->second) {
-@@ -3716,17 +4929,13 @@
+@@ -3716,17 +4944,13 @@
              lv_table_set_cell_value(objects.statistics_table, row, 3, buf);
              sprintf(buf, "%d", it2.trc);
              lv_table_set_cell_value(objects.statistics_table, row, 4, buf);
@@ -2147,7 +2205,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          }
          row++;
          if (row >= statisticTableRows) // fill rows till bottom of 320x240 display
-@@ -3774,13 +4983,30 @@
+@@ -3774,13 +4998,30 @@
      time(&lastHeard);
  
      if (rssi != 0 || snr != 0.0) {
@@ -2182,7 +2240,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          if (pct > 80) {
              lv_obj_set_style_bg_image_src(objects.home_signal_button, &img_home_signal_button_image,
                                            ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
-@@ -4863,10 +6089,9 @@
+@@ -4863,10 +6104,9 @@
      lv_obj_t *slider = lv_event_get_target_obj(e);
      char buf[40];
      uint32_t channel = (uint32_t)lv_slider_get_value(slider);
@@ -2196,7 +2254,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_label_set_text(objects.frequency_slot_label, buf);
  }
  
-@@ -4889,8 +6114,7 @@
+@@ -4889,8 +6129,7 @@
      lv_slider_set_value(objects.frequency_slot_slider, channel, LV_ANIM_ON);
  
      char buf[40];
@@ -2206,7 +2264,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_label_set_text(objects.frequency_slot_label, buf);
  }
  
-@@ -4964,8 +6188,19 @@
+@@ -4964,8 +6203,19 @@
          if (msg[i] == CR_REPLACEMENT)
              msg[i] = '\n';
  
@@ -2228,7 +2286,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  /**
-@@ -4989,22 +6224,30 @@
+@@ -4989,22 +6239,30 @@
      lv_obj_set_style_pad_bottom(hiddenPanel, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
      hiddenPanel->user_data = (void *)requestId;
  
@@ -2266,7 +2324,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      lv_obj_scroll_to_view(hiddenPanel, LV_ANIM_ON);
      lv_obj_move_foreground(objects.message_input_area);
-@@ -5161,7 +6404,8 @@
+@@ -5161,7 +6419,8 @@
  
      // TODO: devices without actual time will report all nodes as lastseen = now
      if (lastHeard) {
@@ -2276,7 +2334,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
          char buf[20];
          bool isOnline = lastHeardToString(lastHeard, buf);
-@@ -5170,7 +6414,7 @@
+@@ -5170,7 +6429,7 @@
              nodesOnline++;
          }
      } else {
@@ -2285,7 +2343,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  
      lv_obj_set_style_text_align(ui_lastHeardLabel, LV_TEXT_ALIGN_RIGHT,
-@@ -5225,6 +6469,46 @@
+@@ -5225,6 +6484,46 @@
      lv_obj_set_style_text_align(ui_Telemetry2Label, LV_TEXT_ALIGN_RIGHT,
                                  ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
  
@@ -2332,7 +2390,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      // optimisation: hide all 6ix extended labels by default; enable only when set
      // lv_obj_add_flag(ui_lastHeardLabel, LV_OBJ_FLAG_HIDDEN); // lastHeard
      lv_obj_add_flag(ui_BatteryLabel, LV_OBJ_FLAG_HIDDEN); // Autohide battery
-@@ -5235,6 +6519,8 @@
+@@ -5235,6 +6534,8 @@
      lv_obj_add_flag(ui_Telemetry2Label, LV_OBJ_FLAG_HIDDEN);
  
      lv_obj_add_event_cb(nodeButton, ui_event_NodeButton, LV_EVENT_ALL, (void *)nodeNum);
@@ -2341,7 +2399,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      // move node into new position within nodePanel
      if (lastHeard) {
-@@ -5322,6 +6608,10 @@
+@@ -5322,6 +6623,10 @@
          }
          lv_label_set_text(it->second->LV_OBJ_IDX(node_lbl_idx), cfg.long_name);
          it->second->LV_OBJ_IDX(node_lbl_idx)->user_data = (void *)nodeNum;
@@ -2352,7 +2410,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          lv_label_set_text(it->second->LV_OBJ_IDX(node_lbs_idx), cfg.short_name);
          char *userData = (char *)&(it->second->LV_OBJ_IDX(node_lbs_idx)->user_data);
          userData[0] = cfg.short_name[0];
-@@ -5365,6 +6655,10 @@
+@@ -5365,6 +6670,10 @@
  
  void TFTView_320x240::updatePosition(uint32_t nodeNum, int32_t lat, int32_t lon, int32_t alt, uint32_t sats, uint32_t precision)
  {
@@ -2363,7 +2421,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      int32_t altU = abs(alt) < 10000 ? alt : 0;
      char units[3] = {};
      if (db.config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_METRIC) {
-@@ -5390,12 +6684,19 @@
+@@ -5390,12 +6699,19 @@
          lonSeconds %= 60;
          char lonLetter = (lon > 0) ? 'E' : 'W';
  
@@ -2389,7 +2447,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
          lv_label_set_text(objects.home_location_label, buf);
  
-@@ -5435,13 +6736,20 @@
+@@ -5435,13 +6751,20 @@
          lv_label_set_text(panel->LV_OBJ_IDX(node_pos1_idx), buf);
          if (sats)
              sprintf(buf, "%d%s MSL  %u sats", altU, units, sats);
@@ -2411,7 +2469,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  
      applyNodesFilter(nodeNum);
-@@ -5450,8 +6758,9 @@
+@@ -5450,8 +6773,9 @@
  void TFTView_320x240::updateDistance(uint32_t nodeNum, int32_t lat, int32_t lon)
  {
      // if we know our position then calculate (simple) distance to other node in km
@@ -2423,7 +2481,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      float dist = sqrt(dx * dx + dy * dy);
  
      // add distance to user short field
-@@ -5461,23 +6770,28 @@
+@@ -5461,23 +6785,28 @@
      buf[1] = userData[1];
      buf[2] = userData[2];
      buf[3] = userData[3];
@@ -2461,7 +2519,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  /**
-@@ -5550,15 +6864,29 @@
+@@ -5550,15 +6879,29 @@
              }
          }
  
@@ -2492,7 +2550,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  }
  
-@@ -5566,30 +6894,69 @@
+@@ -5566,30 +6909,69 @@
  {
      auto it = nodes.find(nodeNum);
      if (it != nodes.end()) {
@@ -2581,7 +2639,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          }
          applyNodesFilter(nodeNum);
      }
-@@ -5627,9 +6994,11 @@
+@@ -5627,9 +7009,11 @@
          if (it != nodes.end()) {
              char buf[32];
              if (rssi == 0 && snr == 0.0) {
@@ -2595,7 +2653,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              }
              lv_label_set_text(it->second->LV_OBJ_IDX(node_sig_idx), buf);
              it->second->LV_OBJ_IDX(node_sig_idx)->user_data = 0;
-@@ -5644,7 +7013,10 @@
+@@ -5644,7 +7028,10 @@
          auto it = nodes.find(nodeNum);
          if (it != nodes.end()) {
              char buf[32];
@@ -2607,7 +2665,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              lv_label_set_text(it->second->LV_OBJ_IDX(node_sig_idx), buf);
              it->second->LV_OBJ_IDX(node_sig_idx)->user_data = (void *)(unsigned long)hopsAway;
              lv_obj_remove_flag(it->second->LV_OBJ_IDX(node_sig_idx), LV_OBJ_FLAG_HIDDEN);
-@@ -5753,6 +7125,186 @@
+@@ -5753,6 +7140,186 @@
          lv_obj_add_flag(objects.home_ethernet_label, LV_OBJ_FLAG_HIDDEN);
          lv_obj_add_flag(objects.home_ethernet_button, LV_OBJ_FLAG_HIDDEN);
      }
@@ -2794,7 +2852,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  // ResponseHandler callbacks
-@@ -5776,9 +7328,16 @@
+@@ -5776,9 +7343,16 @@
  /**
   * handle response from routing
   */
@@ -2812,7 +2870,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      ResponseHandler::Request req{};
      bool ack = false;
      if (from == ownNode) {
-@@ -5852,6 +7411,30 @@
+@@ -5852,6 +7426,30 @@
  /**
   * Signal scanner
   */
@@ -2843,7 +2901,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  void TFTView_320x240::scanSignal(uint32_t scanNo)
  {
      if (scans == 1 && spinnerButton) {
-@@ -5862,17 +7445,44 @@
+@@ -5862,17 +7460,44 @@
          uint32_t to = currentNode;
          uint8_t ch = (uint8_t)(unsigned long)currentPanel->user_data;
          requestId = requests.addRequest(to, ResponseHandler::PositionRequest, (void *)to);
@@ -2890,7 +2948,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              char buf[20];
              sprintf(buf, "SNR\n%.1f", rx_snr);
              lv_label_set_text(objects.signal_scanner_snr_label, buf);
-@@ -6231,8 +7841,40 @@
+@@ -6231,8 +7856,40 @@
      return hide; // TODO || filter.active;
  }
  
@@ -2931,7 +2989,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_label_set_text(objects.alert_label, alert);
      if (show)
          lv_obj_clear_flag(objects.alert_panel, LV_OBJ_FLAG_HIDDEN);
-@@ -6273,6 +7915,15 @@
+@@ -6273,6 +7930,15 @@
                                            : ack ? colorBlueGreen
                                                  : colorYellow,
                                            ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
@@ -2947,7 +3005,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
              // store message
              break;
-@@ -6295,7 +7946,62 @@
+@@ -6295,7 +7961,62 @@
          writePacketLog(p);
      }
      if (p.from != ownNode) {
@@ -3010,7 +3068,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
      updateStatistics(p);
  }
-@@ -6408,6 +8114,7 @@
+@@ -6408,6 +8129,7 @@
      if (ch.role != meshtastic_Channel_Role_DISABLED) {
          setChannelName(ch);
  
@@ -3018,7 +3076,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          lv_obj_set_width(btn[ch.index], lv_pct(80));
          lv_obj_set_style_pad_left(btn[ch.index], 8, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
  
-@@ -6458,6 +8165,7 @@
+@@ -6458,6 +8180,7 @@
          lv_snprintf(buf, sizeof(buf), "%d", ch.index);
          lv_label_set_text(channel[ch.index], buf);
          lv_obj_set_width(btn[ch.index], lv_pct(30));
@@ -3026,7 +3084,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
          if (lv_obj_get_child_cnt(btn[ch.index]) == 2) {
              lv_obj_delete(lv_obj_get_child(btn[ch.index], 1));
-@@ -6519,6 +8227,8 @@
+@@ -6519,6 +8242,8 @@
  {
      db.config.network = cfg;
      db.config.has_network = true;
@@ -3035,7 +3093,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      char buf[40];
      lv_snprintf(buf, sizeof(buf), _("WiFi: %s"), cfg.wifi_ssid[0] ? cfg.wifi_ssid : _("<not set>"));
-@@ -6585,7 +8295,15 @@
+@@ -6585,7 +8310,15 @@
          strcpy(loraFreq, _("region unset"));
      } else if (cfg.use_preset) {
          float frequency = LoRaPresets::getRadioFreq(cfg.region, cfg.modem_preset, cfg.channel_num) + cfg.frequency_offset;
@@ -3052,7 +3110,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          lv_obj_remove_state(objects.basic_settings_modem_preset_button, LV_STATE_DISABLED);
      } else {
          float frequency = cfg.override_frequency + cfg.frequency_offset;
-@@ -6821,23 +8539,27 @@
+@@ -6821,23 +8554,27 @@
  uint32_t TFTView_320x240::timestamp(char *buf, uint32_t datetime, bool update)
  {
      time_t local = datetime;
@@ -3091,7 +3149,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  /**
-@@ -6860,6 +8582,8 @@
+@@ -6860,6 +8597,8 @@
  {
      db.config.bluetooth = cfg;
      db.config.has_bluetooth = true;
@@ -3100,7 +3158,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      if (ownNode == 0) {
          ownNode = id;
-@@ -6991,9 +8715,9 @@
+@@ -6991,9 +8730,9 @@
      lv_obj_set_scroll_dir(container, LV_DIR_VER);
      lv_obj_set_style_pad_left(container, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
      lv_obj_set_style_pad_right(container, 6, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
@@ -3112,7 +3170,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_obj_set_style_pad_column(container, 0, ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
  
      // store new message container
-@@ -7023,8 +8747,60 @@
+@@ -7023,8 +8762,60 @@
  void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const char *msg, uint32_t &msgTime, bool restore)
  {
      ILOG_DEBUG("newMessage: from:0x%08x, to:0x%08x, ch:%d, time:%d", from, to, ch, msgTime);
@@ -3174,7 +3232,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_obj_t *container = nullptr;
      if (to == UINT32_MAX) { // message for group, prepend short name to msg
          if (nodes.find(from) == nodes.end()) {
-@@ -7038,6 +8814,7 @@
+@@ -7038,6 +8829,7 @@
              }
          }
          buf[pos++] = ' ';
@@ -3182,7 +3240,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          container = channelGroup[ch];
      } else { // message for us
          container = messages[from];
-@@ -7049,10 +8826,25 @@
+@@ -7049,10 +8841,25 @@
      }
  
      pos += timestamp(&buf[pos], msgTime, !restore);
@@ -3210,7 +3268,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      if (!restore) {
          // display msg popup if not already viewing the messages
-@@ -7081,7 +8873,7 @@
+@@ -7081,7 +8888,7 @@
   * @param ch
   * @param msg
   */
@@ -3219,7 +3277,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  {
      lv_obj_t *hiddenPanel = lv_obj_create(container);
      lv_obj_set_width(hiddenPanel, lv_pct(100));
-@@ -7105,6 +8897,8 @@
+@@ -7105,6 +8912,8 @@
      add_style_new_message_style(msgLabel);
      lv_obj_add_flag(msgLabel, LV_OBJ_FLAG_CLICK_FOCUSABLE);
      lv_obj_add_event_cb(msgLabel, ui_event_chatNodeButton, LV_EVENT_CLICKED, (void *)nodeNum);
@@ -3228,7 +3286,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      if (state == MeshtasticView::eRunning) {
          lv_obj_scroll_to_view(hiddenPanel, LV_ANIM_ON);
-@@ -7120,6 +8914,29 @@
+@@ -7120,6 +8929,29 @@
      //((uint8_t *)msg.bytes)[msg._size] = 0;
      // ILOG_DEBUG("restoring msg from:0x%08x, to:0x%08x, ch:%d, time:%d, status:%d, trash:%d, size:%d, '%s'", msg.from, msg.to,
      //           msg.ch, msg.time, (int)msg.status, msg.trashFlag, msg._size, msg.bytes);
@@ -3258,7 +3316,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  
      if (msg.from == ownNode) {
          lv_obj_t *container = nullptr;
-@@ -7149,6 +8966,11 @@
+@@ -7149,6 +8981,11 @@
              if (container != activeMsgContainer)
                  lv_obj_add_flag(container, LV_OBJ_FLAG_HIDDEN);
              addMessage(container, msg.time, 0, (char *)msg.bytes, msg.status);
@@ -3270,7 +3328,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
          }
      } else if (nodes.find(msg.from) != nodes.end()) {
          if (msg.trashFlag && chats.find(msg.from) != chats.end()) {
-@@ -7161,22 +8983,25 @@
+@@ -7161,22 +8998,25 @@
          }
      } else {
          int pos = 0;
@@ -3303,7 +3361,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  }
  
-@@ -7200,7 +9025,7 @@
+@@ -7200,7 +9040,7 @@
      // ChatsButton
      lv_obj_t *chatBtn = lv_btn_create(parent_obj);
      lv_obj_set_pos(chatBtn, 0, 0);
@@ -3312,7 +3370,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_obj_add_flag(chatBtn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
      lv_obj_clear_flag(chatBtn, LV_OBJ_FLAG_SCROLLABLE);
      add_style_home_button_style(chatBtn);
-@@ -7243,8 +9068,10 @@
+@@ -7243,8 +9083,10 @@
              lv_obj_set_size(obj, LV_PCT(100), LV_SIZE_CONTENT);
              lv_label_set_long_mode(obj, LV_LABEL_LONG_DOT);
              lv_label_set_text(obj, buf);
@@ -3324,7 +3382,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_LEFT,
                                          ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
          }
-@@ -7275,6 +9102,32 @@
+@@ -7275,6 +9117,32 @@
          }
      }
  
@@ -3357,7 +3415,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      chats[index] = chatBtn;
      updateActiveChats();
      if (index > c_max_channels) {
-@@ -7294,6 +9147,7 @@
+@@ -7294,6 +9162,7 @@
          // mark chat in color
          lv_obj_set_style_border_color(it->second, colorOrange,
                                        ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
@@ -3365,7 +3423,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      }
  }
  
-@@ -7366,6 +9220,11 @@
+@@ -7366,6 +9235,11 @@
          return;
      }
  
@@ -3377,7 +3435,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_obj_add_flag(activeMsgContainer, LV_OBJ_FLAG_HIDDEN);
      activeMsgContainer = channelGroup[ch];
      if (!activeMsgContainer) {
-@@ -7385,6 +9244,11 @@
+@@ -7385,6 +9259,11 @@
   */
  void TFTView_320x240::showMessages(uint32_t nodeNum)
  {
@@ -3389,7 +3447,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_obj_add_flag(activeMsgContainer, LV_OBJ_FLAG_HIDDEN);
      activeMsgContainer = messages[nodeNum];
      if (!activeMsgContainer) {
-@@ -7531,8 +9395,8 @@
+@@ -7531,8 +9410,8 @@
  
  lv_obj_t *TFTView_320x240::showQrCode(lv_obj_t *parent, const char *data)
  {
@@ -3400,7 +3458,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      qr = lv_qrcode_create(parent);
      int32_t size = std::min<int32_t>(lv_obj_get_width(parent), lv_obj_get_height(parent)) - 8;
      lv_qrcode_set_size(qr, size);
-@@ -7540,8 +9404,8 @@
+@@ -7540,8 +9419,8 @@
      lv_qrcode_set_light_color(qr, bg_color);
      lv_qrcode_update(qr, data, strlen(data));
      lv_obj_center(qr);
@@ -3411,7 +3469,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      return qr;
  }
  
-@@ -7708,12 +9572,35 @@
+@@ -7708,12 +9587,35 @@
  
  void TFTView_320x240::updateNodesStatus(void)
  {
@@ -3451,7 +3509,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
      lv_label_set_text(objects.top_nodes_online_label, buf);
  }
  
-@@ -7817,6 +9704,7 @@
+@@ -7817,6 +9719,7 @@
                                      ((lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT));
      }
      lv_label_set_text(objects.home_mail_label, buf);
@@ -3459,7 +3517,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  }
  
  /**
-@@ -8083,7 +9971,8 @@
+@@ -8083,7 +9986,8 @@
  #ifdef ARDUINO_ARCH_ESP32
          freeHeap = ESP.getFreeHeap();
          freeHeap_pct = 100 * freeHeap / ESP.getHeapSize();
@@ -3469,7 +3527,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
  #elif defined(ARCH_PORTDUINO)
          static uint32_t totalMem = LinuxHelper::getTotalMem();
          if (totalMem != 0) {
-@@ -8100,13 +9989,43 @@
+@@ -8100,13 +10004,43 @@
  
  void TFTView_320x240::task_handler(void)
  {
@@ -3514,7 +3572,7 @@ diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTVi
              if (map) {
                  updateLocationMap(THIS->map->getObjectsOnMap());
              }
-@@ -8139,17 +10058,18 @@
+@@ -8139,17 +10073,18 @@
                  lastrun10 = curtime;
                  updateFreeMem();
  
