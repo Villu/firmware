@@ -151,6 +151,18 @@ class MeshService
 
     /// A text one client is sending: show it on the other one too (screen <-> phone), as a message from this node
     void showToOtherClient(const meshtastic_MeshPacket &p, bool fromScreen);
+
+    /// A routing answer on its way to the phone: hand over the copy of the screen's direct message it answers, or drop it
+    void releaseHeldForPhone(const meshtastic_MeshPacket &routing);
+
+    /// A phone app marks every packet it gets from the radio as acknowledged and ignores a later failure for it, so the
+    /// phone's copy of a direct message typed on the screen waits here until the recipient has acknowledged it.
+    struct HeldForPhone {
+        meshtastic_MeshPacket *p;
+        uint32_t sinceMs;
+        bool ackFromUs; // MeshCore: the only answer is this node's own, once the message is queued
+    };
+    HeldForPhone heldForPhone[4] = {};
 #endif
 
     /// Allows the bluetooth handler to free packets after they have been sent

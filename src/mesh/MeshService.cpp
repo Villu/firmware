@@ -560,6 +560,7 @@ void MeshService::sendToPhone(meshtastic_MeshPacket *p)
     // Before the phone queue's own limits: with no phone connected that queue stays full, the screen's must not care.
     if (auto *forScreen = packetPool.allocCopy(*p))
         sendToScreen(forScreen);
+    releaseHeldForPhone(*p);
 #endif
 
     queueForPhone(p);
@@ -641,6 +642,9 @@ void MeshService::showOnScreen(const char *text)
     sendToScreen(p);
 }
 
+// Longer than a direct message's three retries on the slowest preset; past it the phone's copy is dropped unseen
+static constexpr uint32_t HELD_FOR_PHONE_MS = 5 * 60 * 1000UL;
+
 void MeshService::showToOtherClient(const meshtastic_MeshPacket &p, bool fromScreen)
 {
     if (p.which_payload_variant != meshtastic_MeshPacket_decoded_tag ||
@@ -654,10 +658,63 @@ void MeshService::showToOtherClient(const meshtastic_MeshPacket &p, bool fromScr
     if (!copy)
         return;
     copy->from = nodeDB->getNodeNum();
-    if (fromScreen)
-        queueForPhone(copy);
-    else
+    if (!fromScreen) {
         sendToScreen(copy);
+        return;
+    }
+    if (copy->to == 0 || isBroadcast(copy->to)) {
+        queueForPhone(copy);
+        return;
+    }
+    // A direct message: hold the phone's copy until the recipient acknowledges it (releaseHeldForPhone)
+    HeldForPhone *slot = nullptr;
+    for (auto &h : heldForPhone) {
+        if (h.p && !Throttle::isWithinTimespanMs(h.sinceMs, HELD_FOR_PHONE_MS)) {
+            releaseToPool(h.p); // no answer at all: never shown on the phone
+            h.p = nullptr;
+        }
+        if (!h.p && !slot)
+            slot = &h;
+    }
+    if (!slot) {
+        slot = &heldForPhone[0];
+        for (auto &h : heldForPhone)
+            if ((int32_t)(h.sinceMs - slot->sinceMs) < 0)
+                slot = &h;
+        releaseToPool(slot->p);
+    }
+    bool ackFromUs = false;
+#if MESHCORE_COEXIST
+    ackFromUs = MeshCoreModule::isMeshCoreNode(copy->to);
+#endif
+    *slot = {copy, millis(), ackFromUs};
+}
+
+void MeshService::releaseHeldForPhone(const meshtastic_MeshPacket &r)
+{
+    if (r.which_payload_variant != meshtastic_MeshPacket_decoded_tag || r.decoded.portnum != meshtastic_PortNum_ROUTING_APP ||
+        !r.decoded.request_id)
+        return;
+    for (auto &h : heldForPhone) {
+        if (!h.p || h.p->id != r.decoded.request_id)
+            continue;
+        meshtastic_Routing c = meshtastic_Routing_init_default;
+        const bool failed =
+            pb_decode_from_bytes(r.decoded.payload.bytes, r.decoded.payload.size, &meshtastic_Routing_msg, &c) &&
+            c.which_variant == meshtastic_Routing_error_reason_tag && c.error_reason != meshtastic_Routing_Error_NONE;
+        const NodeNum from = getFrom(&r);
+        if (failed) {
+            LOG_INFO("Screen's message 0x%08x to !%08x failed (%d): not shown on the phone", (unsigned)h.p->id,
+                     (unsigned)h.p->to, (int)c.error_reason);
+            releaseToPool(h.p);
+            h.p = nullptr;
+        } else if (from == h.p->to || (h.ackFromUs && from == nodeDB->getNodeNum())) {
+            queueForPhone(h.p); // ahead of the answer itself
+            h.p = nullptr;
+        }
+        // else an ACK from a node that passed it on: keep waiting for the recipient's
+        return;
+    }
 }
 #endif
 

@@ -184,7 +184,54 @@ diff --git a/source/graphics/common/ViewController.cpp b/source/graphics/common/
                  if (node.has_position) {
                      view->updatePosition(node.num, node.position.latitude_i, node.position.longitude_i, node.position.altitude, 0,
                                           node.position.precision_bits);
-@@ -954,7 +984,9 @@
+@@ -909,18 +939,36 @@
+     return true;
+ }
+ 
++// Firmware 2.8 replays the positions and telemetry it has stored to every client after the config download, each stamped
++// with when it was really heard. Live packets are stamped now, or not at all while the firmware has no clock.
++static bool isReplayed(const meshtastic_MeshPacket &p)
++{
++    if (!p.has_rx_time || p.rx_time < 1000000)
++        return false;
++    time_t now;
++    time(&now);
++    if (now < 1000000)
++        return true; // a wall-clock stamp although there is no clock yet
++    return now - (time_t)p.rx_time > 120;
++}
++
+ bool ViewController::packetReceived(const meshtastic_MeshPacket &p)
+ {
+-    ILOG_DEBUG("received packet from 0x%08x, id=0x%08x, portnum=%u", p.from, p.id, p.decoded.portnum);
+-    view->packetReceived(p);
+-
+-    // only for direct neighbors print rssi/snr
+-    if (p.hop_limit == p.hop_start && p.hop_limit > 0) {
+-        view->updateSignalStrength(p.from, p.rx_rssi, p.rx_snr);
+-    } else if (p.hop_start > 0) {
+-        view->updateHopsAway(p.from, p.hop_start - p.hop_limit);
+-    }
+-    view->updateLastHeard(p.from);
++    // a replayed record is old data, not news: no "heard now", signal reading, clock, packet log or detector row
++    const bool replayed = isReplayed(p);
++    ILOG_DEBUG("received %spacket from 0x%08x, id=0x%08x, portnum=%u", replayed ? "replayed " : "", p.from, p.id,
++               p.decoded.portnum);
++    if (!replayed) {
++        view->packetReceived(p);
++
++        // only for direct neighbors print rssi/snr
++        if (p.hop_limit == p.hop_start && p.hop_limit > 0) {
++            view->updateSignalStrength(p.from, p.rx_rssi, p.rx_snr);
++        } else if (p.hop_start > 0) {
++            view->updateHopsAway(p.from, p.hop_start - p.hop_limit);
++        }
++        view->updateLastHeard(p.from);
++    }
+ 
+     switch (p.decoded.portnum) {
+     case meshtastic_PortNum_ALERT_APP:
+@@ -954,11 +1002,14 @@
              // if "to" is our node then this is a reply to a requestPosition request
              if (p.to == myNodeNum) {
                  view->handlePositionResponse(p.from, p.decoded.request_id, p.rx_rssi, p.rx_snr, p.hop_limit == p.hop_start);
@@ -195,6 +242,12 @@ diff --git a/source/graphics/common/ViewController.cpp b/source/graphics/common/
                  view->updatePosition(p.from, position.latitude_i, position.longitude_i, position.altitude, position.sats_in_view,
                                       position.precision_bits);
              }
+-            view->updateTime(position.time);
++            if (!replayed)
++                view->updateTime(position.time);
+         } else {
+             ILOG_ERROR("Error decoding protobuf meshtastic_Position!");
+             return false;
 diff --git a/source/graphics/map/MapPanel.cpp b/source/graphics/map/MapPanel.cpp
 --- a/source/graphics/map/MapPanel.cpp
 +++ b/source/graphics/map/MapPanel.cpp
